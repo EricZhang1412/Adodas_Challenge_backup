@@ -1,0 +1,27 @@
+[project]
+name = "adodas"
+version = "0.0.0"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+  "torch==2.10.0",
+  "numpy==1.26.*",
+  "pandas==2.2.*",
+  "PyYAML==6.0.*",
+  "scikit-learn==1.5.*",
+  "tqdm==4.67.*",
+  "pyarrow==16.1.*",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "tuna"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple/"

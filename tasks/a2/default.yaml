@@ -1,6 +1,6 @@
-feature_root: /media/k3nwong/Data1/test/outputs/pipeline/anonymized
-manifest_dir: /media/k3nwong/Data1/test/outputs/data
-output_dir: /media/k3nwong/Data1/test/adodas_baseline/output/a2
+feature_root: /data/maluzhang-folder/datasets/AdoDAS_Challenge/features
+manifest_dir: /data/maluzhang-folder/datasets/AdoDAS_Challenge/manifests
+output_dir: ./output/a2
 
 feature_selection:
   audio_features:

@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Logs and local caches
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Training outputs
+exp/
+outputs/
+output/
+wandb/
+tensorboard/
+checkpoints/
+*.ckpt
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+.claude/
+
+# Local env files
+.env
