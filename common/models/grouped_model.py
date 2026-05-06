@@ -17,10 +17,10 @@ class ParticipantAggregator(nn.Module):
 
         if method == "mlp":
             self.mlp = nn.Sequential(
-                nn.Linear(d_in, d_out),
+                nn.Linear(d_in, 4*d_out),
                 nn.GELU(),
                 nn.Dropout(dropout),
-                nn.Linear(d_out, d_out),
+                nn.Linear(4*d_out, d_out),
             )
         elif method == "attention":
             self.query = nn.Linear(d_in, 1)

@@ -87,6 +87,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--session_drop_prob", type=float, default=None, help="Prob of dropping a session during training")
     p.add_argument("--early_stop_metric", type=str, default=None,
                     choices=["primary", "val_loss"], help="Metric for early stopping")
+    p.add_argument("--early_stop", type=int, default=None, help="1=enable early stopping, 0=disable")
 
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
@@ -902,11 +903,16 @@ def main() -> None:
     log.info(f"Session loss weight: {session_loss_weight}")
     log.info(f"Session type loss weight: {session_type_loss_weight}")
 
+    use_early_stop = bool(cfg.get("early_stop", True))
     patience = cfg.get("patience", 8)
     early_stop_metric = cfg.get("early_stop_metric", "val_loss")
-    es_mode = "min" if early_stop_metric == "val_loss" else "max"
-    early_stop = EarlyStopping(patience=patience, mode=es_mode)
-    log.info(f"EarlyStopping: patience={patience}, metric={early_stop_metric}, mode={es_mode}")
+    early_stop = None
+    if use_early_stop:
+        es_mode = "min" if early_stop_metric == "val_loss" else "max"
+        early_stop = EarlyStopping(patience=patience, mode=es_mode)
+        log.info(f"EarlyStopping: enabled, patience={patience}, metric={early_stop_metric}, mode={es_mode}")
+    else:
+        log.info("EarlyStopping: disabled")
 
     label_smoothing = cfg.get("label_smoothing", 0.05)
     feature_noise_std = cfg.get("feature_noise_std", 0.01)
@@ -983,10 +989,11 @@ def main() -> None:
             log.info(f"  >>> New best {metric_name}={best_metric:.4f} saved at epoch {epoch}.")
             meta.update_best(epoch, val_metrics)
 
-        es_value = val_metrics["loss"] if early_stop_metric == "val_loss" else primary
-        if early_stop.step(es_value):
-            log.info(f"  EarlyStopping triggered at epoch {epoch} (patience={patience}, metric={early_stop_metric})")
-            break
+        if early_stop is not None:
+            es_value = val_metrics["loss"] if early_stop_metric == "val_loss" else primary
+            if early_stop.step(es_value):
+                log.info(f"  EarlyStopping triggered at epoch {epoch} (patience={patience}, metric={early_stop_metric})")
+                break
 
     log.info("=" * 90)
     total_time = time.time() - t_start

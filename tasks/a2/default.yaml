@@ -1,6 +1,6 @@
 feature_root: /data/maluzhang-folder/datasets/AdoDAS_Challenge/features
 manifest_dir: /data/maluzhang-folder/datasets/AdoDAS_Challenge/manifests
-output_dir: ./output/a2
+output_dir: ./output/a2-4mlp
 
 feature_selection:
   audio_features:
@@ -46,6 +46,7 @@ preload: true
 grad_clip: 1.0
 use_pos_weight: true
 patience: 8
+early_stop: false
 session_loss_weight: 0.5
 session_type_loss_weight: 0.15
 submission_level: participant

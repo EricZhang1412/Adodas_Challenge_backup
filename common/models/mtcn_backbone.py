@@ -185,10 +185,10 @@ class MTCNBackbone(nn.Module):
         self.session_embed = nn.Embedding(cfg.n_sessions, cfg.d_session)
 
         self.fusion_mlp = nn.Sequential(
-            nn.Linear(fusion_in, cfg.d_shared),
+            nn.Linear(fusion_in, 4 * cfg.d_shared),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
-            nn.Linear(cfg.d_shared, cfg.d_shared),
+            nn.Linear(4 * cfg.d_shared, cfg.d_shared),
         )
 
         self._init_weights()
