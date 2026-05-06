@@ -23,7 +23,7 @@ import yaml
 from .data.dataset import FeatureConfig, ITEM_COLS, A1_COLS
 from .data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
 from .models.mtcn_backbone import BackboneConfig, MTCNBackbone
-from .models.heads import A1Head, A2OrdinalHead, a1_loss, a2_ordinal_loss
+from .models.heads import A1Head, A2OrdinalHead, a1_loss, a2_ordinal_loss, a2_combined_loss
 from .models.grouped_model import GroupedModel, CORALHead
 from .utils.seed import seed_everything
 from .utils.metrics import binary_f1, macro_auroc, per_class_f1, mean_qwk, mean_mae, per_item_qwk
@@ -83,6 +83,11 @@ def parse_args() -> argparse.Namespace:
                     choices=["auto", "argmax", "expectation", "monotonic"],
                     help="A2 decode: auto-select on val, or use argmax / expectation / monotonic")
     p.add_argument("--label_smoothing", type=float, default=None, help="Label smoothing factor")
+    p.add_argument("--bce_weight", type=float, default=None, help="A2 ordinal BCE term weight")
+    p.add_argument("--soft_ce_weight", type=float, default=None, help="A2 soft-label CE term weight (0=off)")
+    p.add_argument("--emd_weight", type=float, default=None, help="A2 EMD term weight (0=off)")
+    p.add_argument("--soft_label_sigma", type=float, default=None, help="Gaussian soft-label kernel width")
+    p.add_argument("--emd_norm", type=int, default=None, choices=[1, 2], help="EMD distance order")
     p.add_argument("--feature_noise_std", type=float, default=None, help="Gaussian noise std on features during training")
     p.add_argument("--session_drop_prob", type=float, default=None, help="Prob of dropping a session during training")
     p.add_argument("--early_stop_metric", type=str, default=None,
@@ -334,6 +339,11 @@ def train_one_epoch_grouped(
     best_metric: float = -1.0,
     label_smoothing: float = 0.0,
     feature_noise_std: float = 0.0,
+    bce_weight: float = 1.0,
+    soft_ce_weight: float = 0.0,
+    emd_weight: float = 0.0,
+    soft_label_sigma: float = 1.0,
+    emd_norm: int = 2,
 ) -> float:
     grouped_model.train()
     task_head.train()
@@ -373,7 +383,12 @@ def train_one_epoch_grouped(
             if task == "a1":
                 main_loss = a1_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
             else:
-                main_loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
+                main_loss = a2_combined_loss(
+                    p_logits, targets,
+                    pos_weight=pos_weight, label_smoothing=label_smoothing,
+                    bce_weight=bce_weight, soft_ce_weight=soft_ce_weight, emd_weight=emd_weight,
+                    soft_label_sigma=soft_label_sigma, emd_norm=emd_norm,
+                )
 
             if has_valid_sessions:
                 s_logits = task_head(out["session_reprs"])[valid_session_mask]
@@ -382,8 +397,11 @@ def train_one_epoch_grouped(
                     sess_loss = a1_loss(s_logits, s_targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
                 else:
                     s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21)[valid_session_mask]
-                    sess_loss = a2_ordinal_loss(
-                        s_logits, s_targets, pos_weight=pos_weight, label_smoothing=label_smoothing
+                    sess_loss = a2_combined_loss(
+                        s_logits, s_targets,
+                        pos_weight=pos_weight, label_smoothing=label_smoothing,
+                        bce_weight=bce_weight, soft_ce_weight=soft_ce_weight, emd_weight=emd_weight,
+                        soft_label_sigma=soft_label_sigma, emd_norm=emd_norm,
                     )
 
                 type_loss = F.cross_entropy(
@@ -434,6 +452,11 @@ def validate_grouped(
     use_amp: bool = False,
     pos_weight=None,
     decode_method: str = "expectation",
+    bce_weight: float = 1.0,
+    soft_ce_weight: float = 0.0,
+    emd_weight: float = 0.0,
+    soft_label_sigma: float = 1.0,
+    emd_norm: int = 2,
 ):
     """Validate grouped model. Returns metrics dict."""
     grouped_model.eval()
@@ -462,7 +485,12 @@ def validate_grouped(
             if task == "a1":
                 loss = a1_loss(p_logits, targets, pos_weight=pos_weight)
             else:
-                loss = a2_ordinal_loss(p_logits, targets, pos_weight=pos_weight)
+                loss = a2_combined_loss(
+                    p_logits, targets,
+                    pos_weight=pos_weight,
+                    bce_weight=bce_weight, soft_ce_weight=soft_ce_weight, emd_weight=emd_weight,
+                    soft_label_sigma=soft_label_sigma, emd_norm=emd_norm,
+                )
 
             s_logits = task_head(out["session_reprs"])
 
@@ -903,6 +931,17 @@ def main() -> None:
     log.info(f"Session loss weight: {session_loss_weight}")
     log.info(f"Session type loss weight: {session_type_loss_weight}")
 
+    bce_weight = float(cfg.get("bce_weight", 1.0))
+    soft_ce_weight = float(cfg.get("soft_ce_weight", 0.0))
+    emd_weight = float(cfg.get("emd_weight", 0.0))
+    soft_label_sigma = float(cfg.get("soft_label_sigma", 1.0))
+    emd_norm = int(cfg.get("emd_norm", 2))
+    if task == "a2":
+        log.info(
+            f"A2 loss: bce={bce_weight} + soft_ce={soft_ce_weight} (sigma={soft_label_sigma}) "
+            f"+ emd={emd_weight} (L{emd_norm})"
+        )
+
     use_early_stop = bool(cfg.get("early_stop", True))
     patience = cfg.get("patience", 8)
     early_stop_metric = cfg.get("early_stop_metric", "val_loss")
@@ -944,12 +983,22 @@ def main() -> None:
             best_metric=best_metric,
             label_smoothing=label_smoothing,
             feature_noise_std=feature_noise_std,
+            bce_weight=bce_weight,
+            soft_ce_weight=soft_ce_weight,
+            emd_weight=emd_weight,
+            soft_label_sigma=soft_label_sigma,
+            emd_norm=emd_norm,
         )
 
         val_metrics = validate_grouped(
             grouped_model, task_head, val_loader, device,
             task, epoch, epochs, use_amp, pos_weight=pos_weight_t,
             decode_method=cfg.get("decode_method", "expectation"),
+            bce_weight=bce_weight,
+            soft_ce_weight=soft_ce_weight,
+            emd_weight=emd_weight,
+            soft_label_sigma=soft_label_sigma,
+            emd_norm=emd_norm,
         )
         scheduler.step()
 

@@ -91,3 +91,131 @@ def a2_ordinal_loss(
     if label_smoothing > 0.0:
         targets = targets * (1.0 - label_smoothing) + 0.5 * label_smoothing
     return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
+
+
+def cumulative_to_class_probs(cum_logits: torch.Tensor) -> torch.Tensor:
+    """Convert cumulative ordinal logits P(y>=k) for k=1..K-1 to K-class probabilities.
+
+    Enforces monotonicity via element-wise min on the survival function so that
+    the resulting class probabilities are non-negative and sum to 1.
+
+    Args:
+        cum_logits: (..., K-1) raw logits whose sigmoid models P(y >= k).
+
+    Returns:
+        (..., K) probability tensor.
+    """
+    s = torch.sigmoid(cum_logits)
+    # Enforce monotonic survival function: s_k <= s_{k-1}
+    s_mono = [s[..., 0]]
+    for k in range(1, s.size(-1)):
+        s_mono.append(torch.min(s[..., k], s_mono[-1]))
+    s_mono = torch.stack(s_mono, dim=-1)  # (..., K-1)
+
+    # P(y=0) = 1 - s_1; P(y=k) = s_k - s_{k+1}; P(y=K-1) = s_{K-1}
+    p0 = (1.0 - s_mono[..., 0]).unsqueeze(-1)
+    p_mid = s_mono[..., :-1] - s_mono[..., 1:]
+    p_last = s_mono[..., -1:]
+    probs = torch.cat([p0, p_mid, p_last], dim=-1)
+    return probs.clamp(min=0.0)
+
+
+def build_soft_labels(
+    labels: torch.Tensor,
+    n_classes: int = 4,
+    sigma: float = 1.0,
+) -> torch.Tensor:
+    """Distance-aware soft labels: w_c = exp(-((c - y)/sigma)^2 / 2), softmax-normalized.
+
+    Args:
+        labels: integer labels in [0, n_classes-1], any leading shape.
+        n_classes: number of ordinal classes (4 for DASS-21).
+        sigma: kernel width. Smaller -> sharper, closer to one-hot.
+
+    Returns:
+        Soft probability targets with shape labels.shape + (n_classes,).
+    """
+    classes = torch.arange(n_classes, device=labels.device, dtype=torch.float32)
+    diff = labels.unsqueeze(-1).float() - classes
+    log_w = -0.5 * (diff / max(sigma, 1e-6)) ** 2
+    return F.softmax(log_w, dim=-1)
+
+
+def soft_label_ce_loss(
+    cum_logits: torch.Tensor,
+    labels: torch.Tensor,
+    sigma: float = 1.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Cross-entropy between Gaussian-soft targets and class probs derived from cumulative logits.
+
+    Distance-aware: penalizes far-off predictions more than near ones, so it aligns better
+    with the QWK quadratic weight matrix than per-threshold BCE.
+    """
+    n_classes = cum_logits.size(-1) + 1
+    class_probs = cumulative_to_class_probs(cum_logits)
+    soft_targets = build_soft_labels(labels, n_classes=n_classes, sigma=sigma)
+    log_probs = torch.log(class_probs.clamp(min=eps))
+    return -(soft_targets * log_probs).sum(dim=-1).mean()
+
+
+def emd_ordinal_loss(
+    cum_logits: torch.Tensor,
+    labels: torch.Tensor,
+    p: int = 2,
+) -> torch.Tensor:
+    """Earth Mover's Distance loss on the ordinal cumulative form.
+
+    For one-hot true label y with K classes, the survival function S_true(k) = 1[y >= k]
+    is exactly build_ordinal_targets. With S_pred(k) = sigmoid(logit_k), the squared L2
+    distance between predicted and true CDFs simplifies to MSE between S_pred and S_true:
+
+        ||CDF_pred - CDF_true||_p^p = sum_k |S_pred(k) - S_true(k)|^p   (k=1..K-1)
+
+    This is naturally distance-aware and matches CORAL structure without going through
+    the 4-class projection.
+    """
+    targets = A2OrdinalHead.build_ordinal_targets(labels, n_thresholds=cum_logits.size(-1))
+    s_pred = torch.sigmoid(cum_logits)
+    diff = s_pred - targets
+    if p == 1:
+        loss = diff.abs().sum(dim=-1)
+    else:
+        loss = (diff ** 2).sum(dim=-1)
+    return loss.mean()
+
+
+def a2_combined_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    pos_weight: torch.Tensor | None = None,
+    label_smoothing: float = 0.0,
+    bce_weight: float = 1.0,
+    soft_ce_weight: float = 0.0,
+    emd_weight: float = 0.0,
+    soft_label_sigma: float = 1.0,
+    emd_norm: int = 2,
+) -> torch.Tensor:
+    """A2 loss combining ordinal BCE + Gaussian soft-label CE + EMD.
+
+    Setting soft_ce_weight=0 and emd_weight=0 reproduces a2_ordinal_loss exactly.
+    """
+    total: torch.Tensor | float = 0.0
+
+    if bce_weight > 0.0:
+        total = total + bce_weight * a2_ordinal_loss(
+            logits, labels, pos_weight=pos_weight, label_smoothing=label_smoothing
+        )
+
+    if soft_ce_weight > 0.0:
+        total = total + soft_ce_weight * soft_label_ce_loss(
+            logits, labels, sigma=soft_label_sigma
+        )
+
+    if emd_weight > 0.0:
+        total = total + emd_weight * emd_ordinal_loss(logits, labels, p=emd_norm)
+
+    if isinstance(total, float):
+        # All weights zero — return a zero tensor on the right device/dtype.
+        return logits.new_zeros(())
+    return total

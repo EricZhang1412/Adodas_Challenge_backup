@@ -55,3 +55,11 @@ label_smoothing: 0.05
 feature_noise_std: 0.01
 session_drop_prob: 0.1
 early_stop_metric: val_loss
+
+# A2 loss composition: BCE (ordinal) + Gaussian-soft-label CE + EMD.
+# Set soft_ce_weight=0 and emd_weight=0 to fall back to pure BCE.
+bce_weight: 1.0
+soft_ce_weight: 0.5
+emd_weight: 0.3
+soft_label_sigma: 1.0
+emd_norm: 2
