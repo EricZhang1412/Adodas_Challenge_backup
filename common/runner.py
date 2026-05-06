@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import math
@@ -24,7 +25,7 @@ from .data.dataset import FeatureConfig, ITEM_COLS, A1_COLS
 from .data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
 from .models.mtcn_backbone import BackboneConfig, MTCNBackbone
 from .models.heads import A1Head, A2OrdinalHead, a1_loss, a2_ordinal_loss, a2_combined_loss
-from .models.grouped_model import GroupedModel, CORALHead
+from .models.grouped_model import GroupedModel, CORALHead, DASSubscaleHead
 from .utils.seed import seed_everything
 from .utils.metrics import binary_f1, macro_auroc, per_class_f1, mean_qwk, mean_mae, per_item_qwk
 from .utils.ckpt import save_checkpoint, load_checkpoint
@@ -44,6 +45,56 @@ class _RealtimeFileHandler(logging.FileHandler):
             os.fsync(self.stream.fileno())
         except OSError:
             pass
+
+
+class EMA:
+    """Exponential moving average of model parameters for inference-time smoothing.
+
+    Maintains a shadow copy of trainable params updated each optimizer step:
+        shadow = decay * shadow + (1 - decay) * param.
+    Use the `apply()` context manager to temporarily swap EMA weights into the
+    model for validation/submission, then restore originals on exit.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        self.model = model
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {
+            name: param.data.detach().clone()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+
+    @torch.no_grad()
+    def update(self) -> None:
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(
+                    param.data, alpha=1.0 - self.decay
+                )
+
+    @contextlib.contextmanager
+    def apply(self):
+        originals: dict[str, torch.Tensor] = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                originals[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+        try:
+            yield
+        finally:
+            for name, param in self.model.named_parameters():
+                if name in originals:
+                    param.data.copy_(originals[name])
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return {k: v.clone() for k, v in self.shadow.items()}
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        for k, v in state.items():
+            if k in self.shadow:
+                self.shadow[k].copy_(v)
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -107,6 +158,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad_clip", type=float, default=None)
     p.add_argument("--use_pos_weight", type=int, default=None)
     p.add_argument("--run_inference_after_train", type=int, default=None)
+
+    p.add_argument("--use_ema", type=int, default=None, help="1=apply EMA at val and submission")
+    p.add_argument("--ema_decay", type=float, default=None, help="EMA decay rate (e.g., 0.999)")
+    p.add_argument("--ema_start_epoch", type=int, default=None,
+                   help="Epoch at which EMA weights are used for val/checkpoint selection")
+    p.add_argument("--subscale_loss_weight", type=float, default=None,
+                   help="Weight for DAS subscale auxiliary regression loss (0=off)")
 
     return p.parse_args()
 
@@ -344,9 +402,16 @@ def train_one_epoch_grouped(
     emd_weight: float = 0.0,
     soft_label_sigma: float = 1.0,
     emd_norm: int = 2,
+    ema_gm: "EMA | None" = None,
+    ema_th: "EMA | None" = None,
+    ema_sub: "EMA | None" = None,
+    subscale_head: "nn.Module | None" = None,
+    subscale_loss_weight: float = 0.0,
 ) -> float:
     grouped_model.train()
     task_head.train()
+    if subscale_head is not None:
+        subscale_head.train()
     total_loss = 0.0
     n_batches = 0
 
@@ -414,23 +479,41 @@ def train_one_epoch_grouped(
 
             loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss
 
+            if (
+                task == "a2"
+                and subscale_head is not None
+                and subscale_loss_weight > 0.0
+            ):
+                sub_targets = DASSubscaleHead.compute_targets(targets)
+                sub_preds = subscale_head(out["participant_repr"])
+                loss = loss + subscale_loss_weight * F.smooth_l1_loss(
+                    sub_preds, sub_targets
+                )
+
         optimizer.zero_grad()
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(
-                list(grouped_model.parameters()) + list(task_head.parameters()),
-                max_norm=grad_clip,
-            )
+            _clip_params = list(grouped_model.parameters()) + list(task_head.parameters())
+            if subscale_head is not None:
+                _clip_params = _clip_params + list(subscale_head.parameters())
+            nn.utils.clip_grad_norm_(_clip_params, max_norm=grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            nn.utils.clip_grad_norm_(
-                list(grouped_model.parameters()) + list(task_head.parameters()),
-                max_norm=grad_clip,
-            )
+            _clip_params = list(grouped_model.parameters()) + list(task_head.parameters())
+            if subscale_head is not None:
+                _clip_params = _clip_params + list(subscale_head.parameters())
+            nn.utils.clip_grad_norm_(_clip_params, max_norm=grad_clip)
             optimizer.step()
+
+        if ema_gm is not None:
+            ema_gm.update()
+        if ema_th is not None:
+            ema_th.update()
+        if ema_sub is not None:
+            ema_sub.update()
 
         total_loss += loss.item()
         n_batches += 1
@@ -794,7 +877,18 @@ def main() -> None:
     task = cfg["task"]
 
     seed_everything(cfg.get("seed", 42))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif os.environ.get("ALLOW_CPU", "0") == "1":
+        device = torch.device("cpu")
+    else:
+        raise RuntimeError(
+            "CUDA unavailable — refusing to silently fall back to CPU. "
+            f"Diag: CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}, "
+            f"torch.version.cuda={torch.version.cuda!r}, "
+            f"torch.cuda.device_count()={torch.cuda.device_count()}. "
+            "Set env ALLOW_CPU=1 to run on CPU intentionally."
+        )
 
     output_root = Path(cfg.get("output_dir", "/media/k3nwong/Data1/test/train/output"))
     manifest_dir = Path(cfg.get("manifest_dir", "/media/k3nwong/Data1/test/outputs/data"))
@@ -804,7 +898,15 @@ def main() -> None:
     run_dirs = setup_run_dirs(output_root, run_name)
 
     setup_logging(run_dirs["logs"], task)
-    log.info(f"Device: {device}")
+    if device.type == "cuda":
+        log.info(
+            f"Device: cuda — {torch.cuda.get_device_name(0)} "
+            f"(n_gpu={torch.cuda.device_count()}, "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}, "
+            f"torch.version.cuda={torch.version.cuda})"
+        )
+    else:
+        log.warning(f"Device: {device} — running without GPU (ALLOW_CPU=1)")
     log.info(f"Task: {task}")
     log.info(f"Run name: {run_name}")
     log.info(f"Config: {cfg}")
@@ -897,7 +999,20 @@ def main() -> None:
         else:
             task_head = A2OrdinalHead(bb_cfg.d_shared).to(device)
 
+    subscale_loss_weight = float(cfg.get("subscale_loss_weight", 0.0))
+    subscale_head: nn.Module | None = None
+    if task == "a2" and subscale_loss_weight > 0.0:
+        subscale_head = DASSubscaleHead(
+            bb_cfg.d_shared, dropout=cfg.get("dropout", 0.2)
+        ).to(device)
+        log.info(
+            f"DASSubscaleHead enabled: weight={subscale_loss_weight}, "
+            f"params={sum(p.numel() for p in subscale_head.parameters()):,}"
+        )
+
     n_params = sum(p.numel() for p in grouped_model.parameters()) + sum(p.numel() for p in task_head.parameters())
+    if subscale_head is not None:
+        n_params += sum(p.numel() for p in subscale_head.parameters())
     log.info(f"Model params: {n_params:,}")
 
     use_amp = bool(cfg.get("amp", True))
@@ -917,6 +1032,8 @@ def main() -> None:
             log.info(f"A2 pos_weight shape: {pos_weight_t.shape}")
 
     params = list(grouped_model.parameters()) + list(task_head.parameters())
+    if subscale_head is not None:
+        params += list(subscale_head.parameters())
     optimizer = torch.optim.AdamW(
         params, lr=cfg.get("lr", 1e-3), weight_decay=cfg.get("weight_decay", 1e-2)
     )
@@ -925,6 +1042,24 @@ def main() -> None:
     scheduler = _build_scheduler(optimizer, warmup_epochs, epochs)
     log.info(f"Scheduler: warmup={warmup_epochs} -> cosine, total={epochs}")
     log.info(f"Grad clip: {grad_clip}")
+
+    use_ema = bool(cfg.get("use_ema", False))
+    ema_decay = float(cfg.get("ema_decay", 0.999))
+    ema_start_epoch = int(cfg.get("ema_start_epoch", 5))
+    ema_gm: EMA | None = None
+    ema_th: EMA | None = None
+    ema_sub: EMA | None = None
+    if use_ema:
+        ema_gm = EMA(grouped_model, decay=ema_decay)
+        ema_th = EMA(task_head, decay=ema_decay)
+        if subscale_head is not None:
+            ema_sub = EMA(subscale_head, decay=ema_decay)
+        log.info(
+            f"EMA enabled: decay={ema_decay}, start_epoch={ema_start_epoch} "
+            f"(val/checkpoint use EMA weights from this epoch onward)"
+        )
+    else:
+        log.info("EMA: disabled")
 
     session_loss_weight = cfg.get("session_loss_weight", 0.5)
     session_type_loss_weight = cfg.get("session_type_loss_weight", 0.15)
@@ -988,18 +1123,35 @@ def main() -> None:
             emd_weight=emd_weight,
             soft_label_sigma=soft_label_sigma,
             emd_norm=emd_norm,
+            ema_gm=ema_gm,
+            ema_th=ema_th,
+            ema_sub=ema_sub,
+            subscale_head=subscale_head,
+            subscale_loss_weight=subscale_loss_weight,
         )
 
-        val_metrics = validate_grouped(
-            grouped_model, task_head, val_loader, device,
-            task, epoch, epochs, use_amp, pos_weight=pos_weight_t,
-            decode_method=cfg.get("decode_method", "expectation"),
-            bce_weight=bce_weight,
-            soft_ce_weight=soft_ce_weight,
-            emd_weight=emd_weight,
-            soft_label_sigma=soft_label_sigma,
-            emd_norm=emd_norm,
-        )
+        # Apply EMA weights for validation (and best-checkpoint snapshot below)
+        # only after the configured warmup epoch. Before that the shadow is
+        # still close to init noise; using raw weights is more stable.
+        ema_active = use_ema and ema_gm is not None and epoch >= ema_start_epoch
+        _val_ctx = contextlib.ExitStack()
+        if ema_active:
+            _val_ctx.enter_context(ema_gm.apply())
+            _val_ctx.enter_context(ema_th.apply())
+            if ema_sub is not None:
+                _val_ctx.enter_context(ema_sub.apply())
+
+        with _val_ctx:
+            val_metrics = validate_grouped(
+                grouped_model, task_head, val_loader, device,
+                task, epoch, epochs, use_amp, pos_weight=pos_weight_t,
+                decode_method=cfg.get("decode_method", "expectation"),
+                bce_weight=bce_weight,
+                soft_ce_weight=soft_ce_weight,
+                emd_weight=emd_weight,
+                soft_label_sigma=soft_label_sigma,
+                emd_norm=emd_norm,
+            )
         scheduler.step()
 
         elapsed = time.time() - t0
@@ -1030,12 +1182,28 @@ def main() -> None:
 
         if is_best:
             best_metric = primary
-            save_checkpoint(
-                run_dirs["checkpoints"] / "best.pt",
-                grouped_model, optimizer, epoch, best_metric,
-                extra={"head_state_dict": task_head.state_dict()},
-            )
-            log.info(f"  >>> New best {metric_name}={best_metric:.4f} saved at epoch {epoch}.")
+            # When EMA is active for this epoch, bake EMA weights into the
+            # saved checkpoint so downstream inference loads them directly.
+            _save_ctx = contextlib.ExitStack()
+            if ema_active:
+                _save_ctx.enter_context(ema_gm.apply())
+                _save_ctx.enter_context(ema_th.apply())
+                if ema_sub is not None:
+                    _save_ctx.enter_context(ema_sub.apply())
+            with _save_ctx:
+                save_checkpoint(
+                    run_dirs["checkpoints"] / "best.pt",
+                    grouped_model, optimizer, epoch, best_metric,
+                    extra={
+                        "head_state_dict": task_head.state_dict(),
+                        "subscale_head_state_dict": (
+                            subscale_head.state_dict() if subscale_head is not None else None
+                        ),
+                        "ema_active": ema_active,
+                    },
+                )
+            tag = " (EMA)" if ema_active else ""
+            log.info(f"  >>> New best {metric_name}={best_metric:.4f} saved at epoch {epoch}{tag}.")
             meta.update_best(epoch, val_metrics)
 
         if early_stop is not None:
@@ -1051,8 +1219,16 @@ def main() -> None:
     log.info("Loading best checkpoint for submission generation ...")
     state = load_checkpoint(run_dirs["checkpoints"] / "best.pt", grouped_model, optimizer=None)
     task_head.load_state_dict(state["head_state_dict"])
+    if (
+        subscale_head is not None
+        and state.get("subscale_head_state_dict") is not None
+    ):
+        subscale_head.load_state_dict(state["subscale_head_state_dict"])
+        subscale_head.to(device)
     grouped_model.to(device)
     task_head.to(device)
+    if state.get("ema_active"):
+        log.info("  (best checkpoint contains EMA-smoothed weights)")
 
     submission_level = cfg.get("submission_level", "participant")
     decode_method = _normalize_decode_method(cfg.get("decode_method", "expectation"))

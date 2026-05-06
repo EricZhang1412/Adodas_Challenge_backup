@@ -63,3 +63,15 @@ soft_ce_weight: 0.5
 emd_weight: 0.3
 soft_label_sigma: 1.0
 emd_norm: 2
+
+# DASS subscale auxiliary regression head (D/A/S sums, 7 items each).
+# Injects task structure: each subscale total = ×2 weighted sum of 7 items.
+# Set 0.0 to disable.
+subscale_loss_weight: 0.3
+
+# EMA (exponential moving average) of model weights for inference smoothing.
+# Validation, best-checkpoint selection, and submission all use EMA weights
+# starting from `ema_start_epoch`. Typical gains: +0.3–0.8 QWK on small data.
+use_ema: true
+ema_decay: 0.999
+ema_start_epoch: 5
