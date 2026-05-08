@@ -379,6 +379,36 @@ def compute_a2_pos_weight(manifest_path: Path, n_items=21, n_thresholds=3):
             pw[j, k] = np.clip(np.sqrt((1 - p) / p), 1.0, 10.0)
     return torch.from_numpy(pw).unsqueeze(0)
 
+
+def compute_a2_threshold_init(
+    manifest_path: Path,
+    n_items: int = 21,
+    n_thresholds: int = 3,
+    eps: float = 0.05,
+) -> torch.Tensor:
+    """Per-item CORAL threshold init from training-set class frequencies.
+
+    For each item j and threshold k, returns t_jk such that
+    sigmoid(-t_jk) ≈ P(y >= k+1) when the score is 0, i.e. an uninformative
+    score reproduces the marginal class distribution. CORAL passes
+    raw_thresholds → softplus → cumsum, so the result is structurally > 0;
+    we clamp p ∈ [eps, 1-eps] to keep things finite.
+    """
+    df = pd.read_csv(manifest_path)
+    item_cols = [f"d{i:02d}" for i in range(1, n_items + 1)]
+    target = np.zeros((n_items, n_thresholds), dtype=np.float32)
+    for j, col in enumerate(item_cols):
+        vals = df[col].values.astype(int)
+        for k in range(n_thresholds):
+            p = float(np.clip(np.mean(vals >= (k + 1)), eps, 1.0 - eps))
+            # threshold = logit(1 - p) = log((1-p)/p) so that
+            # P(y >= k+1 | score=0) = sigmoid(-threshold) = p.
+            target[j, k] = float(np.log((1.0 - p) / p))
+    # Sort to enforce monotonic increase (already true if frequencies are
+    # well-formed: π_1 ≥ π_2 ≥ π_3 ⇒ t_1 ≤ t_2 ≤ t_3).
+    target.sort(axis=-1)
+    return torch.from_numpy(target)
+
 def train_one_epoch_grouped(
     grouped_model: GroupedModel,
     task_head: nn.Module,
@@ -994,8 +1024,14 @@ def main() -> None:
         task_head = A1Head(bb_cfg.d_shared, bias_init=bias_init).to(device)
     else:
         if use_coral:
-            task_head = CORALHead(bb_cfg.d_shared).to(device)
-            log.info("Using CORAL head for A2")
+            threshold_init = compute_a2_threshold_init(manifest_dir / "train.csv")
+            task_head = CORALHead(
+                bb_cfg.d_shared, threshold_init=threshold_init
+            ).to(device)
+            log.info(
+                "Using CORAL head for A2 with frequency-based threshold init "
+                f"(per-item targets, mean={threshold_init.mean(dim=0).tolist()})"
+            )
         else:
             task_head = A2OrdinalHead(bb_cfg.d_shared).to(device)
 
@@ -1031,12 +1067,34 @@ def main() -> None:
             pos_weight_t = compute_a2_pos_weight(manifest_dir / "train.csv").to(device)
             log.info(f"A2 pos_weight shape: {pos_weight_t.shape}")
 
-    params = list(grouped_model.parameters()) + list(task_head.parameters())
+    # Split params into (decay, no_decay) groups. We exclude CORAL's
+    # raw_thresholds explicitly: they are seeded from training frequencies
+    # and weight decay would slowly drag them back toward 0, undoing the init.
+    decay_params: list[nn.Parameter] = []
+    no_decay_params: list[nn.Parameter] = []
+    for name, p in grouped_model.named_parameters():
+        decay_params.append(p)
+    for name, p in task_head.named_parameters():
+        if name == "raw_thresholds":
+            no_decay_params.append(p)
+        else:
+            decay_params.append(p)
     if subscale_head is not None:
-        params += list(subscale_head.parameters())
+        decay_params.extend(subscale_head.parameters())
+    weight_decay = cfg.get("weight_decay", 1e-2)
     optimizer = torch.optim.AdamW(
-        params, lr=cfg.get("lr", 1e-3), weight_decay=cfg.get("weight_decay", 1e-2)
+        [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=cfg.get("lr", 1e-3),
     )
+    if no_decay_params:
+        log.info(
+            f"Optimizer param groups: decay={sum(p.numel() for p in decay_params):,}, "
+            f"no_decay={sum(p.numel() for p in no_decay_params):,} "
+            f"(no_decay = CORAL raw_thresholds)"
+        )
     epochs = cfg.get("epochs", 20)
     warmup_epochs = cfg.get("warmup_epochs", 3)
     scheduler = _build_scheduler(optimizer, warmup_epochs, epochs)

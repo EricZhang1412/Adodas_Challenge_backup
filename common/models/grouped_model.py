@@ -166,7 +166,23 @@ class GroupedModel(nn.Module):
 
 class CORALHead(nn.Module):
 
-    def __init__(self, d_in: int, n_items: int = 21, n_thresholds: int = 3):
+    def __init__(
+        self,
+        d_in: int,
+        n_items: int = 21,
+        n_thresholds: int = 3,
+        threshold_init: torch.Tensor | None = None,
+    ):
+        """CORAL ordinal head with one shared score per item and per-item monotonic thresholds.
+
+        Args:
+            threshold_init: optional (n_items, n_thresholds) tensor of *target*
+                cumulative threshold values. If provided, raw_thresholds is
+                seeded so that softplus → cumsum reproduces these targets at
+                init. Typical use: pass logit(P(y < k)) computed from training
+                frequencies so a score of 0 reproduces the marginal class
+                distribution (much better than the constant 0.5 default).
+        """
         super().__init__()
         self.n_items = n_items
         self.n_thresholds = n_thresholds
@@ -174,7 +190,26 @@ class CORALHead(nn.Module):
         self.score_fc = nn.Linear(d_in, n_items)
 
         self.raw_thresholds = nn.Parameter(torch.zeros(n_items, n_thresholds))
-        nn.init.constant_(self.raw_thresholds, 0.5)
+        if threshold_init is not None:
+            init = torch.as_tensor(threshold_init, dtype=torch.float32)
+            assert init.shape == (n_items, n_thresholds), (
+                f"threshold_init shape {tuple(init.shape)} != "
+                f"({n_items}, {n_thresholds})"
+            )
+            # Convert target cumulative thresholds → softplus^-1(spacings).
+            # spacings_k = thresholds_k − thresholds_{k-1} (clamped > 0 to keep
+            # softplus^-1 finite; the clamp is only relevant for items whose
+            # P(y >= k) > 0.5 cases — rare for DASS-21).
+            spacings = torch.zeros_like(init)
+            spacings[..., 0] = init[..., 0]
+            spacings[..., 1:] = init[..., 1:] - init[..., :-1]
+            spacings = spacings.clamp(min=1e-3)
+            # softplus^-1(y) = log(exp(y) − 1) = log(expm1(y))
+            raw_init = torch.log(torch.expm1(spacings).clamp(min=1e-9))
+            with torch.no_grad():
+                self.raw_thresholds.copy_(raw_init)
+        else:
+            nn.init.constant_(self.raw_thresholds, 0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         scores = self.score_fc(x)
