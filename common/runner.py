@@ -15,9 +15,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 import yaml
 
@@ -45,6 +48,78 @@ class _RealtimeFileHandler(logging.FileHandler):
             os.fsync(self.stream.fileno())
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Distributed helpers
+#
+# DDP is opt-in via `torchrun --nproc_per_node=N train.py ...`. Without
+# torchrun the env vars are absent and we run single-GPU exactly as before.
+# All non-main processes are silenced (no log spam, no tqdm) and never write
+# to disk; checkpoints, calibration JSONs, and submissions stay rank-0-only.
+# ---------------------------------------------------------------------------
+
+
+def _setup_distributed() -> tuple[int, int, int, bool]:
+    """Initialize the default process group if running under torchrun.
+
+    Returns: (rank, local_rank, world_size, is_distributed).
+    """
+    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
+        return 0, 0, 1, False
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    world_size = int(os.environ["WORLD_SIZE"])
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "DDP launch detected (RANK / WORLD_SIZE are set) but CUDA is "
+            "unavailable on this process. DDP requires NCCL + GPU."
+        )
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
+    return rank, local_rank, world_size, True
+
+
+def _is_main() -> bool:
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def _world_size() -> int:
+    return dist.get_world_size() if dist.is_initialized() else 1
+
+
+def _module(m: nn.Module) -> nn.Module:
+    """Strip the DDP wrapper if present, otherwise return the module as-is."""
+    return m.module if isinstance(m, DDP) else m
+
+
+@torch.no_grad()
+def _all_gather_concat(t: torch.Tensor) -> torch.Tensor:
+    """All-gather tensors that may differ in size along dim 0, then concat.
+
+    Each rank may produce a slightly different number of samples (last batch
+    of DistributedSampler with drop_last=False). We exchange sizes first, pad
+    to the global max, all_gather, then trim each rank's piece back.
+    """
+    if not dist.is_initialized():
+        return t
+    world = dist.get_world_size()
+    local = torch.tensor([t.size(0)], dtype=torch.long, device=t.device)
+    sizes = [torch.zeros_like(local) for _ in range(world)]
+    dist.all_gather(sizes, local)
+    sizes_int = [int(s.item()) for s in sizes]
+    max_size = max(sizes_int)
+    if t.size(0) < max_size:
+        pad_shape = list(t.shape)
+        pad_shape[0] = max_size - t.size(0)
+        pad = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
+        t_padded = torch.cat([t, pad], dim=0)
+    else:
+        t_padded = t.contiguous()
+    gathered = [torch.zeros_like(t_padded) for _ in range(world)]
+    dist.all_gather(gathered, t_padded)
+    return torch.cat([g[: sizes_int[i]] for i, g in enumerate(gathered)], dim=0)
 
 
 class EMA:
@@ -190,7 +265,19 @@ def load_config(args: argparse.Namespace) -> dict:
 
 
 
-def setup_logging(log_dir: Path, task: str) -> None:
+def setup_logging(log_dir: Path, task: str, rank: int = 0) -> None:
+    """Configure stdout + file logging on rank 0, silence everything else.
+
+    Non-main ranks would otherwise produce N copies of every log line. We
+    fully disable the root logger on those ranks so module-level `log.*`
+    calls become no-ops without each call needing an explicit guard.
+    """
+    if rank != 0:
+        for handler in list(logging.root.handlers):
+            logging.root.removeHandler(handler)
+        logging.disable(logging.CRITICAL)
+        return
+
     log_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = log_dir / f"train_grouped_{task}_{ts}.log"
@@ -448,7 +535,7 @@ def train_one_epoch_grouped(
     desc = f"Train {epoch}/{epochs}"
     if best_metric >= 0:
         desc += f" [best={best_metric:.4f}]"
-    pbar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+    pbar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True, disable=not _is_main())
 
     for batch in pbar:
         flat_batch = _to_device(batch["flat_batch"], device)
@@ -582,7 +669,7 @@ def validate_grouped(
     all_logits = []
     all_sess_preds = []
 
-    for batch in tqdm(loader, desc=f"Val {epoch}/{epochs}", leave=False, dynamic_ncols=True):
+    for batch in tqdm(loader, desc=f"Val {epoch}/{epochs}", leave=False, dynamic_ncols=True, disable=not _is_main()):
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
@@ -627,12 +714,37 @@ def validate_grouped(
         total_loss += loss.item()
         n_batches += 1
 
-    avg_loss = total_loss / max(n_batches, 1)
+    # Reduce val loss across ranks (sum-of-sums / sum-of-counts → global mean).
+    if dist.is_initialized():
+        loss_sum_t = torch.tensor([total_loss], device=device, dtype=torch.float64)
+        nb_t = torch.tensor([n_batches], device=device, dtype=torch.float64)
+        dist.all_reduce(loss_sum_t, op=dist.ReduceOp.SUM)
+        dist.all_reduce(nb_t, op=dist.ReduceOp.SUM)
+        avg_loss = float((loss_sum_t / nb_t.clamp(min=1)).item())
+    else:
+        avg_loss = total_loss / max(n_batches, 1)
+
+    def _gather_np(arrays: list[np.ndarray]) -> np.ndarray:
+        if not arrays:
+            return np.empty(0)
+        local = np.concatenate(arrays)
+        if not dist.is_initialized():
+            return local
+        t = torch.from_numpy(local).to(device)
+        return _all_gather_concat(t).cpu().numpy()
+
+    def _gather_t(tensors: list[torch.Tensor]) -> torch.Tensor:
+        if not tensors:
+            return torch.empty(0)
+        local = torch.cat(tensors, dim=0).to(device)
+        if not dist.is_initialized():
+            return local.cpu()
+        return _all_gather_concat(local).cpu()
 
     if task == "a1":
-        probs_np = np.concatenate(all_preds)
-        labels_np = np.concatenate(all_labels)
-        logits_np = np.concatenate(all_logits)
+        probs_np = _gather_np(all_preds)
+        labels_np = _gather_np(all_labels)
+        logits_np = _gather_np(all_logits)
         mf1 = binary_f1(probs_np, labels_np, threshold=0.5)
         auroc = macro_auroc(probs_np, labels_np)
         pcf1 = per_class_f1(probs_np, labels_np, threshold=0.5)
@@ -658,7 +770,7 @@ def validate_grouped(
             )
 
         if all_sess_preds:
-            sess_probs = np.concatenate(all_sess_preds)
+            sess_probs = _gather_np(all_sess_preds)
             n_sess = sess_probs.shape[0]
             if n_sess % 4 == 0:
                 n_part = n_sess // 4
@@ -682,10 +794,10 @@ def validate_grouped(
             "selection_source": selection_source,
         }
     else:
-        labels_np = np.concatenate(all_labels)
+        labels_np = _gather_np(all_labels)
         auto_selected_decode = None
         if decode_method == "auto":
-            logits_t = torch.cat(all_logits, dim=0)
+            logits_t = _gather_t(all_logits)
             raw_results = _evaluate_a2_decode_candidates(
                 task_head,
                 logits_t,
@@ -699,14 +811,14 @@ def validate_grouped(
                 f"(QWK={float(best_result['qwk']):.4f}, MAE={float(best_result['mae']):.4f})"
             )
         else:
-            preds_np = np.concatenate(all_preds)
+            preds_np = _gather_np(all_preds)
         mqwk = mean_qwk(preds_np, labels_np)
         mmae = mean_mae(preds_np, labels_np)
 
         total = preds_np.size
-        dist = [np.sum(preds_np == v) / total * 100 for v in range(4)]
+        pred_pct = [np.sum(preds_np == v) / total * 100 for v in range(4)]
         gt_dist = [np.sum(labels_np == v) / total * 100 for v in range(4)]
-        log.info(f"    pred dist: 0={dist[0]:.1f}% 1={dist[1]:.1f}% 2={dist[2]:.1f}% 3={dist[3]:.1f}%")
+        log.info(f"    pred dist: 0={pred_pct[0]:.1f}% 1={pred_pct[1]:.1f}% 2={pred_pct[2]:.1f}% 3={pred_pct[3]:.1f}%")
         log.info(f"    GT   dist: 0={gt_dist[0]:.1f}% 1={gt_dist[1]:.1f}% 2={gt_dist[2]:.1f}% 3={gt_dist[3]:.1f}%")
 
         item_qwk = per_item_qwk(preds_np, labels_np)
@@ -751,7 +863,7 @@ def generate_submission_grouped(
         else torch.as_tensor(a2_threshold_offsets, device=device, dtype=torch.float32)
     )
 
-    for batch in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True):
+    for batch in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True, disable=not _is_main()):
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
@@ -906,8 +1018,18 @@ def main() -> None:
     cfg = load_config(args)
     task = cfg["task"]
 
+    # DDP launch detection (torchrun sets RANK / WORLD_SIZE / LOCAL_RANK).
+    # Single-GPU runs without torchrun get rank=0, world_size=1.
+    rank, local_rank, world_size, is_ddp = _setup_distributed()
+
+    # Seed: keep base seed deterministic across ranks (torch.manual_seed is the
+    # same), but DistributedSampler still shuffles distinctly per rank via
+    # its own internal seed + epoch number.
     seed_everything(cfg.get("seed", 42))
-    if torch.cuda.is_available():
+
+    if is_ddp:
+        device = torch.device(f"cuda:{local_rank}")
+    elif torch.cuda.is_available():
         device = torch.device("cuda")
     elif os.environ.get("ALLOW_CPU", "0") == "1":
         device = torch.device("cpu")
@@ -923,12 +1045,23 @@ def main() -> None:
     output_root = Path(cfg.get("output_dir", "/media/k3nwong/Data1/test/train/output"))
     manifest_dir = Path(cfg.get("manifest_dir", "/media/k3nwong/Data1/test/outputs/data"))
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = build_run_name(cfg, task, timestamp, training_mode="grouped_participant")
-    run_dirs = setup_run_dirs(output_root, run_name)
+    # Only rank 0 builds the run directory tree and computes the timestamped
+    # run_name. Other ranks pass placeholder None values; they never write.
+    if _is_main():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = build_run_name(cfg, task, timestamp, training_mode="grouped_participant")
+        run_dirs = setup_run_dirs(output_root, run_name)
+    else:
+        run_name = ""
+        run_dirs = {}  # never accessed on non-main ranks
 
-    setup_logging(run_dirs["logs"], task)
-    if device.type == "cuda":
+    setup_logging(run_dirs.get("logs", Path(".")), task, rank=rank)
+    if is_ddp:
+        log.info(
+            f"DDP enabled: world_size={world_size}, rank={rank}, local_rank={local_rank}, "
+            f"device={device}, gpu={torch.cuda.get_device_name(local_rank)}"
+        )
+    elif device.type == "cuda":
         log.info(
             f"Device: cuda — {torch.cuda.get_device_name(0)} "
             f"(n_gpu={torch.cuda.device_count()}, "
@@ -941,7 +1074,15 @@ def main() -> None:
     log.info(f"Run name: {run_name}")
     log.info(f"Config: {cfg}")
 
-    meta = RunMetadata(run_dirs["root"], cfg, task, run_name)
+    # RunMetadata writes JSON to disk on construction → rank 0 only.
+    # Other ranks get a no-op stub so update_best() / set_extra() / finish()
+    # become safe no-ops without explicit rank guards everywhere.
+    class _MetaStub:
+        meta: dict = {}
+        def update_best(self, *a, **k): pass
+        def set_extra(self, *a, **k): pass
+        def finish(self, *a, **k): pass
+    meta = RunMetadata(run_dirs["root"], cfg, task, run_name) if _is_main() else _MetaStub()
 
     _defaults = FeatureConfig()
     feat_cfg = FeatureConfig(
@@ -968,7 +1109,13 @@ def main() -> None:
 
     preload = bool(cfg.get("preload", True))
     if preload:
-        log.info("Preloading data into RAM ...")
+        if is_ddp:
+            log.info(
+                f"Preloading data into RAM (× {world_size} processes — each rank "
+                "keeps its own copy; check that total fits in host memory) ..."
+            )
+        else:
+            log.info("Preloading data into RAM ...")
         t_pre = time.time()
         train_gb = train_ds.preload(desc="Preload train")
         val_gb = val_ds.preload(desc="Preload val")
@@ -978,14 +1125,32 @@ def main() -> None:
 
     log.info(f"batch_size={batch_size}, num_workers={num_workers}")
 
+    if is_ddp:
+        train_sampler = DistributedSampler(
+            train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
+        )
+        val_sampler = DistributedSampler(
+            val_ds, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False
+        )
+        log.info(
+            f"DistributedSampler: per-rank train≈{len(train_ds)//world_size}, "
+            f"val≈{len(val_ds)//world_size}; effective train batch = "
+            f"{batch_size * world_size}"
+        )
+    else:
+        train_sampler = None
+        val_sampler = None
+
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
+        train_ds, batch_size=batch_size,
+        sampler=train_sampler, shuffle=(train_sampler is None),
         num_workers=num_workers, collate_fn=grouped_collate_fn,
         pin_memory=True, drop_last=True,
         persistent_workers=num_workers > 0,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False,
+        val_ds, batch_size=batch_size,
+        sampler=val_sampler, shuffle=False,
         num_workers=num_workers, collate_fn=grouped_collate_fn,
         pin_memory=True,
         persistent_workers=num_workers > 0,
@@ -1051,6 +1216,16 @@ def main() -> None:
         n_params += sum(p.numel() for p in subscale_head.parameters())
     log.info(f"Model params: {n_params:,}")
 
+    # DDP-wrap each top-level module. Optimizer + EMA still reference the
+    # underlying parameters directly (DDP shares the storage), so we build
+    # those before wrapping by walking _module(...). State-dict save/load
+    # also goes through _module(...) to avoid the "module." key prefix.
+    if is_ddp:
+        grouped_model = DDP(grouped_model, device_ids=[local_rank], find_unused_parameters=False)
+        task_head = DDP(task_head, device_ids=[local_rank], find_unused_parameters=False)
+        if subscale_head is not None:
+            subscale_head = DDP(subscale_head, device_ids=[local_rank], find_unused_parameters=False)
+
     use_amp = bool(cfg.get("amp", True))
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
     if use_amp:
@@ -1070,17 +1245,19 @@ def main() -> None:
     # Split params into (decay, no_decay) groups. We exclude CORAL's
     # raw_thresholds explicitly: they are seeded from training frequencies
     # and weight decay would slowly drag them back toward 0, undoing the init.
+    # Walk the unwrapped modules so name matching ("raw_thresholds") works
+    # whether or not DDP has prefixed everything with "module.".
     decay_params: list[nn.Parameter] = []
     no_decay_params: list[nn.Parameter] = []
-    for name, p in grouped_model.named_parameters():
+    for _name, p in _module(grouped_model).named_parameters():
         decay_params.append(p)
-    for name, p in task_head.named_parameters():
-        if name == "raw_thresholds":
+    for _name, p in _module(task_head).named_parameters():
+        if _name == "raw_thresholds":
             no_decay_params.append(p)
         else:
             decay_params.append(p)
     if subscale_head is not None:
-        decay_params.extend(subscale_head.parameters())
+        decay_params.extend(_module(subscale_head).parameters())
     weight_decay = cfg.get("weight_decay", 1e-2)
     optimizer = torch.optim.AdamW(
         [
@@ -1108,10 +1285,12 @@ def main() -> None:
     ema_th: EMA | None = None
     ema_sub: EMA | None = None
     if use_ema:
-        ema_gm = EMA(grouped_model, decay=ema_decay)
-        ema_th = EMA(task_head, decay=ema_decay)
+        # EMA must track the unwrapped module's parameters; DDP shares the
+        # storage, so updates to the inner module are visible to the wrapper.
+        ema_gm = EMA(_module(grouped_model), decay=ema_decay)
+        ema_th = EMA(_module(task_head), decay=ema_decay)
         if subscale_head is not None:
-            ema_sub = EMA(subscale_head, decay=ema_decay)
+            ema_sub = EMA(_module(subscale_head), decay=ema_decay)
         log.info(
             f"EMA enabled: decay={ema_decay}, start_epoch={ema_start_epoch} "
             f"(val/checkpoint use EMA weights from this epoch onward)"
@@ -1166,6 +1345,14 @@ def main() -> None:
 
     for epoch in range(1, epochs + 1):
         t0 = time.time()
+
+        # DistributedSampler needs a deterministic, epoch-dependent shuffle
+        # seed so every rank sees the same order on the same epoch but a
+        # different order across epochs.
+        if isinstance(train_sampler, DistributedSampler):
+            train_sampler.set_epoch(epoch)
+        if isinstance(val_sampler, DistributedSampler):
+            val_sampler.set_epoch(epoch)
 
         train_loss = train_one_epoch_grouped(
             grouped_model, task_head, train_loader, optimizer, device,
@@ -1242,27 +1429,31 @@ def main() -> None:
             best_metric = primary
             # When EMA is active for this epoch, bake EMA weights into the
             # saved checkpoint so downstream inference loads them directly.
-            _save_ctx = contextlib.ExitStack()
-            if ema_active:
-                _save_ctx.enter_context(ema_gm.apply())
-                _save_ctx.enter_context(ema_th.apply())
-                if ema_sub is not None:
-                    _save_ctx.enter_context(ema_sub.apply())
-            with _save_ctx:
-                save_checkpoint(
-                    run_dirs["checkpoints"] / "best.pt",
-                    grouped_model, optimizer, epoch, best_metric,
-                    extra={
-                        "head_state_dict": task_head.state_dict(),
-                        "subscale_head_state_dict": (
-                            subscale_head.state_dict() if subscale_head is not None else None
-                        ),
-                        "ema_active": ema_active,
-                    },
-                )
-            tag = " (EMA)" if ema_active else ""
-            log.info(f"  >>> New best {metric_name}={best_metric:.4f} saved at epoch {epoch}{tag}.")
-            meta.update_best(epoch, val_metrics)
+            # Only rank 0 writes; other ranks just update their local
+            # best_metric so early-stopping decisions stay consistent.
+            if _is_main():
+                _save_ctx = contextlib.ExitStack()
+                if ema_active:
+                    _save_ctx.enter_context(ema_gm.apply())
+                    _save_ctx.enter_context(ema_th.apply())
+                    if ema_sub is not None:
+                        _save_ctx.enter_context(ema_sub.apply())
+                with _save_ctx:
+                    save_checkpoint(
+                        run_dirs["checkpoints"] / "best.pt",
+                        _module(grouped_model), optimizer, epoch, best_metric,
+                        extra={
+                            "head_state_dict": _module(task_head).state_dict(),
+                            "subscale_head_state_dict": (
+                                _module(subscale_head).state_dict()
+                                if subscale_head is not None else None
+                            ),
+                            "ema_active": ema_active,
+                        },
+                    )
+                tag = " (EMA)" if ema_active else ""
+                log.info(f"  >>> New best {metric_name}={best_metric:.4f} saved at epoch {epoch}{tag}.")
+                meta.update_best(epoch, val_metrics)
 
         if early_stop is not None:
             es_value = val_metrics["loss"] if early_stop_metric == "val_loss" else primary
@@ -1273,6 +1464,36 @@ def main() -> None:
     log.info("=" * 90)
     total_time = time.time() - t_start
     log.info(f"Training complete. Best {metric_name}={best_metric:.4f}, time={_fmt_duration(total_time)}")
+
+    # Barrier so non-main ranks don't race ahead and exit before rank 0 has
+    # finished writing the best checkpoint. After this we tear down the
+    # process group and let only rank 0 carry on with calibration + final
+    # submission — the work is small and not worth keeping ranks 1..N alive.
+    # NB: after destroy_process_group(), `_is_main()` returns True on every
+    # rank (it's based on dist.is_initialized()), so we must guard with the
+    # `rank` captured at startup, not the helper.
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+    if rank != 0:
+        return
+
+    # Single-process mode from here on: unwrap DDP and reload from the saved
+    # (already EMA-baked, prefix-free) checkpoint into the unwrapped modules.
+    grouped_model = _module(grouped_model)
+    task_head = _module(task_head)
+    if subscale_head is not None:
+        subscale_head = _module(subscale_head)
+
+    # Rebuild val_loader without DistributedSampler so post-train calibration
+    # and submission see the FULL val set (the distributed sampler was only
+    # giving each rank its own subset).
+    if is_ddp:
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, collate_fn=grouped_collate_fn,
+            pin_memory=True,
+        )
 
     log.info("Loading best checkpoint for submission generation ...")
     state = load_checkpoint(run_dirs["checkpoints"] / "best.pt", grouped_model, optimizer=None)
@@ -1371,10 +1592,10 @@ def main() -> None:
             result = strategy_results[name]
             preds = result["preds"]
             total = preds.size
-            dist = [np.sum(preds == v) / total * 100 for v in range(4)]
+            pred_pct = [np.sum(preds == v) / total * 100 for v in range(4)]
             log.info(
                 f"    {name:<22} QWK={float(result['qwk']):.4f} MAE={float(result['mae']):.4f} "
-                f"| 0={dist[0]:.1f}% 1={dist[1]:.1f}% 2={dist[2]:.1f}% 3={dist[3]:.1f}%"
+                f"| 0={pred_pct[0]:.1f}% 1={pred_pct[1]:.1f}% 2={pred_pct[2]:.1f}% 3={pred_pct[3]:.1f}%"
             )
 
         log.info(

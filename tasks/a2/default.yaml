@@ -1,3 +1,19 @@
+# A2 default config.
+#
+# Single-GPU launch:
+#     uv run python train.py --task a2 --config tasks/a2/default.yaml
+#
+# Multi-GPU (DDP) launch — auto-detected from torchrun env vars:
+#     uv run torchrun --standalone --nproc_per_node=4 train.py \
+#         --task a2 --config tasks/a2/default.yaml
+#
+# DDP notes:
+#  * Effective batch size = batch_size * world_size; consider scaling lr by
+#    sqrt(world_size) (or linear) if you change cluster sizes.
+#  * preload=true makes each rank keep its own RAM copy of features; verify
+#    train_gb*world_size fits in host memory before scaling up.
+#  * Best checkpoint is saved once on rank 0 with EMA weights baked in.
+
 feature_root: /data/maluzhang-folder/datasets/AdoDAS_Challenge/features
 manifest_dir: /data/maluzhang-folder/datasets/AdoDAS_Challenge/manifests
 output_dir: ./output/a2-4mlp
