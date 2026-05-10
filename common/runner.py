@@ -214,10 +214,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--emd_weight", type=float, default=None, help="A2 EMD term weight (0=off)")
     p.add_argument("--soft_label_sigma", type=float, default=None, help="Gaussian soft-label kernel width")
     p.add_argument("--emd_norm", type=int, default=None, choices=[1, 2], help="EMD distance order")
+    p.add_argument("--focal_gamma", type=float, default=None,
+                    help="A2 BCE focal-loss gamma (0=plain BCE; 1.5–2 emphasises hard high-severity items)")
+    p.add_argument("--pos_weight_cap", type=float, default=None,
+                    help="Upper bound on per-(item, threshold) BCE pos_weight (default 20)")
     p.add_argument("--feature_noise_std", type=float, default=None, help="Gaussian noise std on features during training")
     p.add_argument("--session_drop_prob", type=float, default=None, help="Prob of dropping a session during training")
     p.add_argument("--early_stop_metric", type=str, default=None,
-                    choices=["primary", "val_loss"], help="Metric for early stopping")
+                    choices=["primary", "val_loss", "mean_qwk"],
+                    help="Metric for early stopping ('mean_qwk' is an alias of 'primary' for A2)")
     p.add_argument("--early_stop", type=int, default=None, help="1=enable early stopping, 0=disable")
 
     p.add_argument("--batch_size", type=int, default=None)
@@ -455,7 +460,20 @@ def _compute_bias_init_a1(manifest_path: Path) -> list[float]:
     return biases
 
 
-def compute_a2_pos_weight(manifest_path: Path, n_items=21, n_thresholds=3):
+def compute_a2_pos_weight(
+    manifest_path: Path,
+    n_items: int = 21,
+    n_thresholds: int = 3,
+    cap: float = 20.0,
+):
+    """Per-(item, threshold) pos_weight = sqrt((1-p)/p), capped at `cap`.
+
+    The previous cap of 10.0 was equivalent to truncating P(y>=k) >= 1%, which
+    silently halved the gradient on the rarest positives — exactly the items
+    where the v4/v5 logs show top3 per-item QWK stuck at 0.05–0.15. Bumping the
+    cap to 20 doubles the effective gradient on those without making BCE
+    explode at init.
+    """
     df = pd.read_csv(manifest_path)
     item_cols = [f"d{i:02d}" for i in range(1, n_items + 1)]
     pw = np.ones((n_items, n_thresholds), dtype=np.float32)
@@ -463,7 +481,7 @@ def compute_a2_pos_weight(manifest_path: Path, n_items=21, n_thresholds=3):
         vals = df[col].values.astype(int)
         for k in range(n_thresholds):
             p = max(np.mean(vals >= (k + 1)), 1e-6)
-            pw[j, k] = np.clip(np.sqrt((1 - p) / p), 1.0, 10.0)
+            pw[j, k] = np.clip(np.sqrt((1 - p) / p), 1.0, float(cap))
     return torch.from_numpy(pw).unsqueeze(0)
 
 
@@ -471,23 +489,38 @@ def compute_a2_threshold_init(
     manifest_path: Path,
     n_items: int = 21,
     n_thresholds: int = 3,
-    eps: float = 0.05,
+    prior_count: float = 10.0,
+    eps: float = 0.005,
 ) -> torch.Tensor:
     """Per-item CORAL threshold init from training-set class frequencies.
 
     For each item j and threshold k, returns t_jk such that
     sigmoid(-t_jk) ≈ P(y >= k+1) when the score is 0, i.e. an uninformative
-    score reproduces the marginal class distribution. CORAL passes
-    raw_thresholds → softplus → cumsum, so the result is structurally > 0;
-    we clamp p ∈ [eps, 1-eps] to keep things finite.
+    score reproduces the marginal class distribution.
+
+    Uses Beta(prior_count, prior_count) additive smoothing so that items with
+    zero observed positives at a threshold still get a small but finite p
+    instead of being capped by a hard floor. With n_train ≈ 4200, prior_count=10
+    yields p_min ≈ 10/4220 ≈ 2.4e-3 (logit ≈ 6.0) which lets rarely-positive
+    items stay rare, and reproduces the empirical mean P(y>=3) ≈ 2.5% target
+    (≈ logit 3.66). The hard `eps` floor is only a numerical safety net.
+
+    The previous implementation used eps=0.05 which clipped P(y>=3) for every
+    item to 0.05, giving a uniform 3rd-threshold target of log(19) ≈ 2.94
+    instead of the natural ~3.6, leaving the head with no meaningful prior on
+    high-severity items.
     """
     df = pd.read_csv(manifest_path)
     item_cols = [f"d{i:02d}" for i in range(1, n_items + 1)]
+    n = len(df)
     target = np.zeros((n_items, n_thresholds), dtype=np.float32)
     for j, col in enumerate(item_cols):
         vals = df[col].values.astype(int)
         for k in range(n_thresholds):
-            p = float(np.clip(np.mean(vals >= (k + 1)), eps, 1.0 - eps))
+            count = float((vals >= (k + 1)).sum())
+            # Beta(prior_count, prior_count) posterior mean
+            p = (count + prior_count) / (n + 2.0 * prior_count)
+            p = float(np.clip(p, eps, 1.0 - eps))
             # threshold = logit(1 - p) = log((1-p)/p) so that
             # P(y >= k+1 | score=0) = sigmoid(-threshold) = p.
             target[j, k] = float(np.log((1.0 - p) / p))
@@ -519,6 +552,7 @@ def train_one_epoch_grouped(
     emd_weight: float = 0.0,
     soft_label_sigma: float = 1.0,
     emd_norm: int = 2,
+    focal_gamma: float = 0.0,
     ema_gm: "EMA | None" = None,
     ema_th: "EMA | None" = None,
     ema_sub: "EMA | None" = None,
@@ -570,6 +604,7 @@ def train_one_epoch_grouped(
                     pos_weight=pos_weight, label_smoothing=label_smoothing,
                     bce_weight=bce_weight, soft_ce_weight=soft_ce_weight, emd_weight=emd_weight,
                     soft_label_sigma=soft_label_sigma, emd_norm=emd_norm,
+                    focal_gamma=focal_gamma,
                 )
 
             if has_valid_sessions:
@@ -584,6 +619,7 @@ def train_one_epoch_grouped(
                         pos_weight=pos_weight, label_smoothing=label_smoothing,
                         bce_weight=bce_weight, soft_ce_weight=soft_ce_weight, emd_weight=emd_weight,
                         soft_label_sigma=soft_label_sigma, emd_norm=emd_norm,
+                        focal_gamma=focal_gamma,
                     )
 
                 type_loss = F.cross_entropy(
@@ -657,6 +693,7 @@ def validate_grouped(
     emd_weight: float = 0.0,
     soft_label_sigma: float = 1.0,
     emd_norm: int = 2,
+    focal_gamma: float = 0.0,
 ):
     """Validate grouped model. Returns metrics dict."""
     grouped_model.eval()
@@ -690,6 +727,7 @@ def validate_grouped(
                     pos_weight=pos_weight,
                     bce_weight=bce_weight, soft_ce_weight=soft_ce_weight, emd_weight=emd_weight,
                     soft_label_sigma=soft_label_sigma, emd_norm=emd_norm,
+                    focal_gamma=focal_gamma,
                 )
 
             s_logits = task_head(out["session_reprs"])
@@ -1239,8 +1277,15 @@ def main() -> None:
             pos_weight_t = torch.tensor(pw, dtype=torch.float32, device=device)
             log.info(f"pos_weight [D/A/S]: {pw[0]:.2f} / {pw[1]:.2f} / {pw[2]:.2f}")
         else:
-            pos_weight_t = compute_a2_pos_weight(manifest_dir / "train.csv").to(device)
-            log.info(f"A2 pos_weight shape: {pos_weight_t.shape}")
+            pos_weight_cap = float(cfg.get("pos_weight_cap", 20.0))
+            pos_weight_t = compute_a2_pos_weight(
+                manifest_dir / "train.csv", cap=pos_weight_cap
+            ).to(device)
+            pw_max = float(pos_weight_t.max().item())
+            log.info(
+                f"A2 pos_weight shape: {pos_weight_t.shape}, cap={pos_weight_cap}, "
+                f"observed max={pw_max:.2f}"
+            )
 
     # Split params into (decay, no_decay) groups. We exclude CORAL's
     # raw_thresholds explicitly: they are seeded from training frequencies
@@ -1308,10 +1353,11 @@ def main() -> None:
     emd_weight = float(cfg.get("emd_weight", 0.0))
     soft_label_sigma = float(cfg.get("soft_label_sigma", 1.0))
     emd_norm = int(cfg.get("emd_norm", 2))
+    focal_gamma = float(cfg.get("focal_gamma", 0.0))
     if task == "a2":
         log.info(
             f"A2 loss: bce={bce_weight} + soft_ce={soft_ce_weight} (sigma={soft_label_sigma}) "
-            f"+ emd={emd_weight} (L{emd_norm})"
+            f"+ emd={emd_weight} (L{emd_norm}) + focal_gamma={focal_gamma}"
         )
 
     use_early_stop = bool(cfg.get("early_stop", True))
@@ -1368,6 +1414,7 @@ def main() -> None:
             emd_weight=emd_weight,
             soft_label_sigma=soft_label_sigma,
             emd_norm=emd_norm,
+            focal_gamma=focal_gamma,
             ema_gm=ema_gm,
             ema_th=ema_th,
             ema_sub=ema_sub,
@@ -1396,6 +1443,7 @@ def main() -> None:
                 emd_weight=emd_weight,
                 soft_label_sigma=soft_label_sigma,
                 emd_norm=emd_norm,
+                focal_gamma=focal_gamma,
             )
         scheduler.step()
 
