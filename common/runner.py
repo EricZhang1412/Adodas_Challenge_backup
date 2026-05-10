@@ -353,17 +353,23 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _build_scheduler(optimizer, warmup_epochs, total_epochs):
+    # Guard against short smoke runs where total_epochs <= warmup_epochs would
+    # leave the cosine phase with T_max <= 0 (ZeroDivisionError on .step()).
+    # Cap warmup at total_epochs - 1 and ensure cosine T_max >= 1.
+    warmup_epochs = max(0, min(warmup_epochs, total_epochs - 1))
     if warmup_epochs > 0:
         warmup = torch.optim.lr_scheduler.LinearLR(
             optimizer, start_factor=1e-2, end_factor=1.0, total_iters=warmup_epochs
         )
         cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_epochs - warmup_epochs, eta_min=1e-6
+            optimizer, T_max=max(1, total_epochs - warmup_epochs), eta_min=1e-6
         )
         return torch.optim.lr_scheduler.SequentialLR(
             optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs]
         )
-    return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
+    return torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, total_epochs), eta_min=1e-6
+    )
 
 
 def _flatten_valid_session_mask(session_valid: torch.Tensor) -> torch.Tensor:
