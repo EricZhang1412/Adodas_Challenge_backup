@@ -64,9 +64,15 @@ amp: true
 preload: true
 grad_clip: 1.0
 use_pos_weight: true
-# Headroom past the typical peak (~ep 50) so noise doesn't trigger early.
-patience: 12
-early_stop: true
+# Disabled: with ema_decay=0.999, EMA shadow takes ~20 epochs to catch up
+# to the live model. During that "warmup dip" val QWK is artificially
+# depressed (mostly init noise) — early_stop on mean_qwk fires before the
+# real signal ever recovers. Best is at the *raw-weights* warmup peak (~ep 4),
+# then EMA val takes another ~15-25 epochs to beat it. patience would need
+# to be ~30 to survive that, which defeats the purpose. Keep epochs=60 as
+# the natural cap instead. See run …194452 for the failure case.
+patience: 8
+early_stop: false
 session_loss_weight: 0.5
 session_type_loss_weight: 0.15
 submission_level: participant
