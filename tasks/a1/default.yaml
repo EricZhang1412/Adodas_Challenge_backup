@@ -1,0 +1,62 @@
+feature_root: /media/k3nwong/Data1/test/outputs/pipeline/anonymized
+manifest_dir: /media/k3nwong/Data1/test/outputs/data
+output_dir: /media/k3nwong/Data1/test/adodas_baseline/output/a1
+
+feature_selection:
+  audio_features:
+    - mel_mfcc
+    - vad
+    - egemaps
+    - ssl_embed          # chinese-hubert-large (1024d)
+  video_features:
+    - headpose_geom
+    - face_behavior
+    - qc_stats
+    - vad_agg
+    - body_pose          # 体态姿势变化
+    - global_motion      # 全局运动能量
+    - vision_ssl_embed   # dinov2-large (1024d)
+  audio_ssl_model_tag: chinese-hubert-large
+  video_ssl_model_tag: dinov2-large
+
+ssl_group_tags: {}
+vision_ssl_group_tags: {}
+
+mask_policy: and_core
+core_audio: [mel_mfcc, ssl_embed]
+core_video: [vision_ssl_embed, qc_stats]
+
+d_adapter: 64
+d_model: 256
+tcn_layers: 6
+tcn_kernel_size: 3
+asp_alpha: 0.5
+asp_beta: 0.5
+dropout: 0.2
+d_shared: 256
+
+# 跨模态注意力：在 TCN 后、ASP 前对齐信息
+use_cross_modal_attn: true
+cross_modal_heads: 8
+
+aggregator: attention
+batch_size: 32
+lr: 0.0005
+weight_decay: 0.01
+warmup_epochs: 3
+epochs: 40
+seed: 42
+num_workers: 8
+amp: true
+preload: true
+grad_clip: 1.0
+use_pos_weight: true
+patience: 8
+session_loss_weight: 0.3
+session_type_loss_weight: 0.15
+submission_level: participant
+decode_method: auto
+label_smoothing: 0.05
+feature_noise_std: 0.01
+session_drop_prob: 0.1
+early_stop_metric: primary

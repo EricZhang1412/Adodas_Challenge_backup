@@ -1,0 +1,1 @@
+python infer.py --task a2 --split test/test_hidden --checkpoint /data/maluzhang-folder/zhangdh/code/PAMI/MM/0508/output/a2/runs/a2__grouped__coral__a-base-mel_mfcc+vad+egemaps__a-ssl-chinese-hubert-large__v-base-headpose+facebeh+qc+vadagg+bodypose+globmot__v-ssl-dinov2-large__mask-andcore__pw_pwthr_autodecode_thrcalib__seed42__20260508_081433/checkpoints/best.pt

@@ -1,0 +1,62 @@
+feature_root: /data/maluzhang-folder/datasets/AdoDAS_Challenge/features
+manifest_dir: /data/maluzhang-folder/datasets/AdoDAS_Challenge/manifests
+output_dir: ./output/a2
+
+feature_selection:
+  audio_features:
+    - mel_mfcc
+    - vad
+    - egemaps
+    - ssl_embed          # chinese-hubert-large (1024d)
+  video_features:
+    - headpose_geom
+    - face_behavior
+    - qc_stats
+    - vad_agg
+    - body_pose
+    - global_motion
+    - vision_ssl_embed   # dinov2-large (1024d)
+  audio_ssl_model_tag: chinese-hubert-large
+  video_ssl_model_tag: dinov2-large
+
+ssl_group_tags: {}
+vision_ssl_group_tags: {}
+
+mask_policy: and_core
+core_audio: [mel_mfcc, ssl_embed]
+core_video: [vision_ssl_embed, qc_stats]
+
+d_adapter: 64
+d_model: 256
+tcn_layers: 6
+tcn_kernel_size: 3
+asp_alpha: 0.5
+asp_beta: 0.5
+dropout: 0.2
+d_shared: 256
+
+use_cross_modal_attn: true
+cross_modal_heads: 8
+
+aggregator: attention
+use_coral: true
+batch_size: 32
+lr: 0.0005
+weight_decay: 0.01
+warmup_epochs: 3
+epochs: 50
+seed: 42
+num_workers: 8
+amp: true
+preload: true
+grad_clip: 1.0
+use_pos_weight: true
+patience: 10
+session_loss_weight: 0.5
+session_type_loss_weight: 0.15
+submission_level: participant
+decode_method: auto
+label_smoothing: 0.05
+feature_noise_std: 0.01
+session_drop_prob: 0.1
+early_stop_metric: val_loss
