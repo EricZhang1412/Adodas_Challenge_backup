@@ -12,11 +12,57 @@ from tqdm import tqdm
 
 from .dataset import (
     SESSIONS, SESSION_TO_IDX, ITEM_COLS, A1_COLS,
+    AUX_SCHEMA, AUX_NAMES,
     FeatureConfig, align_to_grid,
 )
 from .feature_io import SequenceData, load_egemaps_pooled, load_sequence
 
 log = logging.getLogger(__name__)
+
+
+def _extract_aux(
+    row: pd.Series, manifest_columns: set[str]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract 5 auxiliary labels and a validity mask for one participant.
+
+    Returns:
+        labels: int64 array of shape (len(AUX_NAMES),) with 0 placeholder for missing.
+        masks:  bool array of shape (len(AUX_NAMES),). True iff label is usable.
+
+    Missing values (column absent / NaN / out-of-range / parental_favoritism when
+    only_child=Yes) are masked out so the loss skips them.
+    """
+    n = len(AUX_NAMES)
+    labels = np.zeros(n, dtype=np.int64)
+    masks = np.zeros(n, dtype=bool)
+
+    only_child_raw = row.get(AUX_SCHEMA["only_child"]["col"])
+    is_only_child = False
+    try:
+        if only_child_raw is not None and not pd.isna(only_child_raw):
+            is_only_child = int(only_child_raw) == 1
+    except (TypeError, ValueError):
+        is_only_child = False
+
+    for i, name in enumerate(AUX_NAMES):
+        spec = AUX_SCHEMA[name]
+        col = spec["col"]
+        if col not in manifest_columns:
+            continue
+        raw = row.get(col)
+        if raw is None or (isinstance(raw, float) and np.isnan(raw)) or pd.isna(raw):
+            continue
+        try:
+            v = int(raw) - int(spec["value_offset"])
+        except (TypeError, ValueError):
+            continue
+        if v < 0 or v >= int(spec["n_classes"]):
+            continue
+        if spec.get("mask_when_only_child", False) and is_only_child:
+            continue
+        labels[i] = v
+        masks[i] = True
+    return labels, masks
 
 
 class GroupedParticipantDataset(Dataset):
@@ -38,6 +84,7 @@ class GroupedParticipantDataset(Dataset):
         grouped = manifest.groupby(group_cols)
 
         self.participants: list[dict[str, Any]] = []
+        manifest_columns = set(manifest.columns)
         for (school, cls, pid), group in grouped:
             sess_rows = {}
             for _, row in group.iterrows():
@@ -48,6 +95,8 @@ class GroupedParticipantDataset(Dataset):
             y_a1 = np.array([float(any_row.get(c, -1)) for c in A1_COLS], dtype=np.float32)
             y_a2 = np.array([float(any_row.get(c, -1)) for c in ITEM_COLS], dtype=np.float32)
 
+            aux_labels, aux_masks = _extract_aux(any_row, manifest_columns)
+
             self.participants.append({
                 "anon_school": str(school),
                 "anon_class": str(cls),
@@ -55,6 +104,8 @@ class GroupedParticipantDataset(Dataset):
                 "sess_rows": sess_rows,
                 "y_a1": y_a1,
                 "y_a2": y_a2,
+                "aux_labels": aux_labels,
+                "aux_masks": aux_masks,
             })
 
         self._feature_dims: dict[str, int] | None = None
@@ -269,6 +320,8 @@ class GroupedParticipantDataset(Dataset):
             "session_valid": np.array(session_valid, dtype=bool),
             "y_a1": torch.from_numpy(info["y_a1"]),
             "y_a2": torch.from_numpy(info["y_a2"]),
+            "aux_labels": torch.from_numpy(info["aux_labels"]),
+            "aux_masks": torch.from_numpy(info["aux_masks"]),
             "anon_pid": info["anon_pid"],
             "anon_school": info["anon_school"],
             "anon_class": info["anon_class"],
@@ -438,6 +491,8 @@ def grouped_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "flat_batch": flat_batch,
         "participant_y_a1": torch.stack([b["y_a1"] for b in batch]),
         "participant_y_a2": torch.stack([b["y_a2"] for b in batch]),
+        "participant_aux_labels": torch.stack([b["aux_labels"] for b in batch]),
+        "participant_aux_masks": torch.stack([b["aux_masks"] for b in batch]),
         "session_valid": torch.from_numpy(np.stack(session_valid_list)),
         "session_types": torch.tensor(session_types, dtype=torch.long),
         "n_participants": B,

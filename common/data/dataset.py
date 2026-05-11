@@ -22,6 +22,19 @@ ITEM_COLS = [f"d{i:02d}" for i in range(1, 22)]
 A1_COLS = ["y_D", "y_A", "y_S"]
 POOLED_AUDIO_FEATURES = {"egemaps"}
 
+# Auxiliary attribute supervision schema.
+# value_offset is subtracted from raw csv value to map to [0, n_classes).
+# `mask_when_only_child` (parental_favoritism only): the attribute is N/A
+# when the participant is an only child, so we mask it out for those samples.
+AUX_SCHEMA: dict[str, dict[str, Any]] = {
+    "family_structure":    {"col": "Family structure",            "n_classes": 6, "value_offset": 1},
+    "only_child":          {"col": "Only child status",           "n_classes": 2, "value_offset": 0},
+    "parental_favoritism": {"col": "Parental favoritism",         "n_classes": 3, "value_offset": 1, "mask_when_only_child": True},
+    "academic_change":     {"col": "Academic performance change", "n_classes": 3, "value_offset": 1},
+    "emotional_change":    {"col": "Emotional state change",      "n_classes": 3, "value_offset": 1},
+}
+AUX_NAMES: list[str] = list(AUX_SCHEMA.keys())
+
 
 @dataclass
 class FeatureConfig:

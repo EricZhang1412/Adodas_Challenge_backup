@@ -24,7 +24,8 @@ from .data.dataset import FeatureConfig, ITEM_COLS, A1_COLS
 from .data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
 from .models.mtcn_backbone import BackboneConfig, MTCNBackbone
 from .models.heads import A1Head, A2OrdinalHead, a1_loss, a2_combined_loss
-from .models.grouped_model import GroupedModel, CORALHead
+from .models.grouped_model import AuxHead, GroupedModel, CORALHead
+from .data.dataset import AUX_NAMES
 from .utils.seed import seed_everything
 from .utils.metrics import binary_f1, macro_auroc, per_class_f1, mean_qwk, mean_mae, per_item_qwk
 from .utils.ckpt import save_checkpoint, load_checkpoint
@@ -98,6 +99,11 @@ def parse_args() -> argparse.Namespace:
                    help="1=distance-aware expectation auxiliary (off-by-3 > off-by-1)")
     p.add_argument("--a2_expectation_distance_power", type=float, default=None,
                    help="Distance-aware power p in (1 + |E[y]-y|^p), typical 1 or 2")
+
+    p.add_argument("--use_aux_supervision", type=int, default=None,
+                    help="1=enable participant-level auxiliary attribute supervision (training only)")
+    p.add_argument("--aux_loss_weight", type=float, default=None,
+                    help="Global lambda multiplied onto the summed aux CE loss")
 
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
@@ -349,11 +355,18 @@ def train_one_epoch_grouped(
     a2_expectation_loss_weight: float = 0.0,
     a2_expectation_distance_aware: bool = False,
     a2_expectation_distance_power: float = 1.0,
+    aux_head: AuxHead | None = None,
+    aux_loss_weight: float = 0.0,
+    aux_per_task_weights: dict[str, float] | None = None,
 ) -> float:
     grouped_model.train()
     task_head.train()
+    if aux_head is not None:
+        aux_head.train()
     total_loss = 0.0
     n_batches = 0
+    aux_running: dict[str, float] = {n: 0.0 for n in AUX_NAMES}
+    aux_running_total = 0.0
 
     desc = f"Train {epoch}/{epochs}"
     if best_metric >= 0:
@@ -429,22 +442,33 @@ def train_one_epoch_grouped(
 
             loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss
 
+            if aux_head is not None and aux_loss_weight > 0.0:
+                aux_labels = batch["participant_aux_labels"].to(device)
+                aux_masks = batch["participant_aux_masks"].to(device)
+                aux_logits_dict = aux_head(out["participant_repr"])
+                aux_loss, aux_per_task = aux_head.compute_loss(
+                    aux_logits_dict, aux_labels, aux_masks, aux_per_task_weights
+                )
+                if aux_loss.requires_grad:
+                    loss = loss + aux_loss_weight * aux_loss
+                aux_running_total += float(aux_loss.detach().item())
+                for k, v in aux_per_task.items():
+                    aux_running[k] += v
+
         optimizer.zero_grad()
+        clip_params = list(grouped_model.parameters()) + list(task_head.parameters())
+        if aux_head is not None:
+            clip_params = clip_params + list(aux_head.parameters())
+
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(
-                list(grouped_model.parameters()) + list(task_head.parameters()),
-                max_norm=grad_clip,
-            )
+            nn.utils.clip_grad_norm_(clip_params, max_norm=grad_clip)
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
-            nn.utils.clip_grad_norm_(
-                list(grouped_model.parameters()) + list(task_head.parameters()),
-                max_norm=grad_clip,
-            )
+            nn.utils.clip_grad_norm_(clip_params, max_norm=grad_clip)
             optimizer.step()
 
         total_loss += loss.item()
@@ -452,6 +476,11 @@ def train_one_epoch_grouped(
         pbar.set_postfix_str(f"{loss.item():.4f}")
 
     pbar.close()
+    if aux_head is not None and aux_loss_weight > 0.0 and n_batches > 0:
+        avg_aux_total = aux_running_total / n_batches
+        per_task_avg = {k: v / n_batches for k, v in aux_running.items()}
+        per_task_str = " ".join(f"{k}={v:.3f}" for k, v in per_task_avg.items())
+        log.info(f"    aux loss avg={avg_aux_total:.4f} | {per_task_str}")
     return total_loss / max(n_batches, 1)
 
 
@@ -469,10 +498,13 @@ def validate_grouped(
     decode_method: str = "expectation",
     a2_soft_qwk_weight: float = 0.0,
     a2_emd_weight: float = 0.0,
+    aux_head: AuxHead | None = None,
 ):
     """Validate grouped model. Returns metrics dict."""
     grouped_model.eval()
     task_head.eval()
+    if aux_head is not None:
+        aux_head.eval()
     decode_method = _normalize_decode_method(decode_method)
     total_loss = 0.0
     n_batches = 0
@@ -480,6 +512,8 @@ def validate_grouped(
     all_labels = []
     all_logits = []
     all_sess_preds = []
+    aux_correct: dict[str, int] = {n: 0 for n in AUX_NAMES}
+    aux_seen: dict[str, int] = {n: 0 for n in AUX_NAMES}
 
     for batch in tqdm(loader, desc=f"Val {epoch}/{epochs}", leave=False, dynamic_ncols=True):
         flat_batch = _to_device(batch["flat_batch"], device)
@@ -507,6 +541,19 @@ def validate_grouped(
 
             s_logits = task_head(out["session_reprs"])
 
+            if aux_head is not None:
+                aux_labels = batch["participant_aux_labels"].to(device)
+                aux_masks = batch["participant_aux_masks"].to(device)
+                aux_logits_dict = aux_head(out["participant_repr"])
+                for i, name in enumerate(AUX_NAMES):
+                    m = aux_masks[:, i]
+                    n_valid = int(m.sum().item())
+                    if n_valid == 0:
+                        continue
+                    pred = aux_logits_dict[name][m].argmax(dim=-1)
+                    aux_correct[name] += int((pred == aux_labels[m, i]).sum().item())
+                    aux_seen[name] += n_valid
+
         if task == "a1":
             logits_np = p_logits.float().cpu().numpy()
             probs = torch.sigmoid(p_logits.float()).cpu().numpy()
@@ -528,6 +575,15 @@ def validate_grouped(
         n_batches += 1
 
     avg_loss = total_loss / max(n_batches, 1)
+
+    if aux_head is not None and any(aux_seen.values()):
+        parts = []
+        for name in AUX_NAMES:
+            if aux_seen[name] > 0:
+                parts.append(f"{name}={aux_correct[name] / aux_seen[name]:.3f}")
+            else:
+                parts.append(f"{name}=na")
+        log.info(f"    aux acc: {' '.join(parts)}")
 
     if task == "a1":
         probs_np = np.concatenate(all_preds)
@@ -916,7 +972,20 @@ def main() -> None:
         else:
             task_head = A2OrdinalHead(bb_cfg.d_shared).to(device)
 
+    use_aux_supervision = bool(cfg.get("use_aux_supervision", False))
+    aux_loss_weight = float(cfg.get("aux_loss_weight", 0.0))
+    aux_per_task_weights = cfg.get("aux_per_task_weights", {}) or {}
+    aux_head: AuxHead | None = None
+    if use_aux_supervision and aux_loss_weight > 0.0:
+        aux_head = AuxHead(bb_cfg.d_shared, dropout=cfg.get("dropout", 0.2)).to(device)
+        log.info(
+            f"Aux supervision ON: lambda={aux_loss_weight}, "
+            f"per_task_weights={aux_per_task_weights or '{all 1.0}'}"
+        )
+
     n_params = sum(p.numel() for p in grouped_model.parameters()) + sum(p.numel() for p in task_head.parameters())
+    if aux_head is not None:
+        n_params += sum(p.numel() for p in aux_head.parameters())
     log.info(f"Model params: {n_params:,}")
 
     use_amp = bool(cfg.get("amp", True))
@@ -936,6 +1005,8 @@ def main() -> None:
             log.info(f"A2 pos_weight shape: {pos_weight_t.shape}")
 
     params = list(grouped_model.parameters()) + list(task_head.parameters())
+    if aux_head is not None:
+        params = params + list(aux_head.parameters())
     optimizer = torch.optim.AdamW(
         params, lr=cfg.get("lr", 1e-3), weight_decay=cfg.get("weight_decay", 1e-2)
     )
@@ -993,6 +1064,9 @@ def main() -> None:
             feature_noise_std=feature_noise_std,
             a2_soft_qwk_weight=a2_soft_qwk_weight,
             a2_emd_weight=a2_emd_weight,
+            aux_head=aux_head,
+            aux_loss_weight=aux_loss_weight,
+            aux_per_task_weights=aux_per_task_weights,
         )
 
         val_metrics = validate_grouped(
@@ -1001,6 +1075,7 @@ def main() -> None:
             decode_method=cfg.get("decode_method", "expectation"),
             a2_soft_qwk_weight=a2_soft_qwk_weight,
             a2_emd_weight=a2_emd_weight,
+            aux_head=aux_head,
         )
         scheduler.step()
 
@@ -1032,10 +1107,13 @@ def main() -> None:
 
         if is_best:
             best_metric = primary
+            ckpt_extra = {"head_state_dict": task_head.state_dict()}
+            if aux_head is not None:
+                ckpt_extra["aux_head_state_dict"] = aux_head.state_dict()
             save_checkpoint(
                 run_dirs["checkpoints"] / "best.pt",
                 grouped_model, optimizer, epoch, best_metric,
-                extra={"head_state_dict": task_head.state_dict()},
+                extra=ckpt_extra,
             )
             log.info(f"  >>> New best {metric_name}={best_metric:.4f} saved at epoch {epoch}.")
             meta.update_best(epoch, val_metrics)
@@ -1052,6 +1130,9 @@ def main() -> None:
     log.info("Loading best checkpoint for submission generation ...")
     state = load_checkpoint(run_dirs["checkpoints"] / "best.pt", grouped_model, optimizer=None)
     task_head.load_state_dict(state["head_state_dict"])
+    if aux_head is not None and "aux_head_state_dict" in state:
+        aux_head.load_state_dict(state["aux_head_state_dict"])
+        aux_head.to(device)
     grouped_model.to(device)
     task_head.to(device)
 

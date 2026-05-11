@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..data.dataset import AUX_NAMES, AUX_SCHEMA
 from .mtcn_backbone import MTCNBackbone, BackboneConfig
 
 
@@ -105,6 +106,66 @@ class GroupedModel(nn.Module):
             "participant_repr": participant_repr,
             "session_type_logits": session_type_logits,
         }
+
+
+class AuxHead(nn.Module):
+    """Multi-task auxiliary supervision head over participant_repr.
+
+    Predicts each of the 5 demographic/context attributes as a separate
+    classification problem. Inference does not use this head.
+    """
+
+    def __init__(self, d_in: int, hidden: int = 128, dropout: float = 0.2) -> None:
+        super().__init__()
+        self.names = list(AUX_NAMES)
+        self.shared = nn.Sequential(
+            nn.LayerNorm(d_in),
+            nn.Linear(d_in, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.heads = nn.ModuleDict({
+            name: nn.Linear(hidden, AUX_SCHEMA[name]["n_classes"])
+            for name in self.names
+        })
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        h = self.shared(x)
+        return {name: head(h) for name, head in self.heads.items()}
+
+    def compute_loss(
+        self,
+        logits_dict: dict[str, torch.Tensor],
+        labels: torch.Tensor,
+        masks: torch.Tensor,
+        per_task_weights: dict[str, float] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Masked CE per aux, weighted-summed into a scalar.
+
+        labels : (B, len(AUX_NAMES)) long
+        masks  : (B, len(AUX_NAMES)) bool, True iff label valid for this sample
+        Returns (total_loss, per_task_loss_floats_for_logging).
+        """
+        device = labels.device
+        total = torch.zeros((), device=device)
+        per_task: dict[str, float] = {}
+        any_valid = False
+        for i, name in enumerate(self.names):
+            m = masks[:, i]
+            n_valid = int(m.sum().item())
+            if n_valid == 0:
+                per_task[name] = 0.0
+                continue
+            logits = logits_dict[name][m]
+            tgt = labels[m, i]
+            ce = F.cross_entropy(logits, tgt)
+            w = float((per_task_weights or {}).get(name, 1.0))
+            total = total + w * ce
+            per_task[name] = float(ce.detach().item())
+            any_valid = True
+        if not any_valid:
+            return total, per_task
+        return total, per_task
 
 
 class CORALHead(nn.Module):
