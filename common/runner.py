@@ -1705,7 +1705,10 @@ def main() -> None:
             )
 
             manifest_df = pd.read_csv(manifest_path)
-            file_ids = []
+            anon_schools: list[str] = []
+            anon_classes: list[str] = []
+            anon_pids: list[str] = []
+            out_sessions: list[str] = []
             filtered_preds = []
             if submission_level == "participant":
                 pid_to_info = {}
@@ -1719,7 +1722,9 @@ def main() -> None:
                     if info is None:
                         continue
                     school, cls = info
-                    file_ids.append(f"{school}_{cls}_{pid_str}")
+                    anon_schools.append(school)
+                    anon_classes.append(cls)
+                    anon_pids.append(pid_str)
                     filtered_preds.append(pred)
                 expected_rows = int(manifest_df["anon_pid"].astype(str).nunique())
             else:
@@ -1735,7 +1740,10 @@ def main() -> None:
                     if info is None:
                         continue
                     school, cls = info
-                    file_ids.append(f"{school}_{cls}_{key[0]}_{key[1]}")
+                    anon_schools.append(school)
+                    anon_classes.append(cls)
+                    anon_pids.append(key[0])
+                    out_sessions.append(key[1])
                     filtered_preds.append(pred)
                 expected_rows = len(manifest_df)
 
@@ -1745,21 +1753,35 @@ def main() -> None:
                 preds = np.zeros((0, 3), dtype=np.float32)
             else:
                 preds = np.zeros((0, 21), dtype=np.int64)
-            if len(file_ids) != expected_rows:
+            if len(anon_pids) != expected_rows:
                 log.warning(
-                    f"Submission row count mismatch for {split_name}: expected={expected_rows} generated={len(file_ids)}"
+                    f"Submission row count mismatch for {split_name}: expected={expected_rows} generated={len(anon_pids)}"
                 )
 
             if task == "a1":
+                data = {
+                    "anon_school": anon_schools,
+                    "anon_class": anon_classes,
+                    "anon_pid": anon_pids,
+                }
+                if submission_level != "participant":
+                    data["session"] = out_sessions
                 sub = pd.DataFrame({
-                    "file_id": file_ids,
+                    **data,
                     "p_D": preds[:, 0],
                     "p_A": preds[:, 1],
                     "p_S": preds[:, 2],
                 })
             else:
                 item_cols = [f"d{i:02d}" for i in range(1, 22)]
-                sub = pd.DataFrame({"file_id": file_ids})
+                data = {
+                    "anon_school": anon_schools,
+                    "anon_class": anon_classes,
+                    "anon_pid": anon_pids,
+                }
+                if submission_level != "participant":
+                    data["session"] = out_sessions
+                sub = pd.DataFrame(data)
                 for j, col in enumerate(item_cols):
                     sub[col] = preds[:, j]
 
