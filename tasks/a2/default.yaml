@@ -1,3 +1,19 @@
+# A2 default config.
+#
+# Single-GPU launch:
+#     uv run python train.py --task a2 --config tasks/a2/default.yaml
+#
+# Multi-GPU (DDP) launch — auto-detected from torchrun env vars:
+#     uv run torchrun --standalone --nproc_per_node=4 train.py \
+#         --task a2 --config tasks/a2/default.yaml
+#
+# DDP notes:
+#  * Effective batch size = batch_size * world_size; consider scaling lr by
+#    sqrt(world_size) (or linear) if you change cluster sizes.
+#  * preload=true makes each rank keep its own RAM copy of features; verify
+#    train_gb*world_size fits in host memory before scaling up.
+#  * Best checkpoint is saved once on rank 0 with EMA weights baked in.
+
 feature_root: /data/maluzhang-folder/datasets/AdoDAS_Challenge/features
 manifest_dir: /data/maluzhang-folder/datasets/AdoDAS_Challenge/manifests
 output_dir: ./output/a2-4mlp
@@ -38,13 +54,23 @@ batch_size: 64
 lr: 0.001
 weight_decay: 0.01
 warmup_epochs: 3
-epochs: 40
+# v5 (200 epoch) showed best EMA QWK at epoch 52, then a 25% degradation by
+# epoch 200. Cap at 60 with QWK-monitored early stop so we don't burn compute
+# past the peak. Cosine schedule still completes within this window.
+epochs: 60
 seed: 42
 num_workers: 8
 amp: true
 preload: true
 grad_clip: 1.0
 use_pos_weight: true
+# Disabled: with ema_decay=0.999, EMA shadow takes ~20 epochs to catch up
+# to the live model. During that "warmup dip" val QWK is artificially
+# depressed (mostly init noise) — early_stop on mean_qwk fires before the
+# real signal ever recovers. Best is at the *raw-weights* warmup peak (~ep 4),
+# then EMA val takes another ~15-25 epochs to beat it. patience would need
+# to be ~30 to survive that, which defeats the purpose. Keep epochs=60 as
+# the natural cap instead. See run …194452 for the failure case.
 patience: 8
 early_stop: false
 session_loss_weight: 0.5
@@ -54,7 +80,9 @@ decode_method: auto
 label_smoothing: 0.05
 feature_noise_std: 0.01
 session_drop_prob: 0.1
-early_stop_metric: val_loss
+# val_loss barely tracks QWK on this task (Δ 3% over the whole run vs Δ 30%+
+# on QWK). Use the actual selection metric instead.
+early_stop_metric: mean_qwk
 
 # A2 loss composition: BCE (ordinal) + Gaussian-soft-label CE + EMD.
 # Set soft_ce_weight=0 and emd_weight=0 to fall back to pure BCE.
@@ -63,3 +91,27 @@ soft_ce_weight: 0.5
 emd_weight: 0.3
 soft_label_sigma: 1.0
 emd_norm: 2
+
+# Focal modulation on the BCE term: (1 - p_t)^gamma reweights so the loss
+# concentrates on hard examples — primarily the rarely-positive class-3
+# thresholds where v5 still saw bot3 per-item QWK around 0.10. 0.0 = plain BCE.
+# Try 1.5–2.0 if you want to push class-2/3 signal further.
+focal_gamma: 0.0
+
+# Upper bound on per-(item, threshold) BCE pos_weight = sqrt((1-p)/p).
+# v4/v5 used 10 which silently truncated weights for items with
+# P(y>=3) < 1%, eating signal on the rarest positives. 20 keeps gradients
+# meaningful without making BCE explode at init.
+pos_weight_cap: 20.0
+
+# DASS subscale auxiliary regression head (D/A/S sums, 7 items each).
+# Injects task structure: each subscale total = ×2 weighted sum of 7 items.
+# Set 0.0 to disable.
+subscale_loss_weight: 0.3
+
+# EMA (exponential moving average) of model weights for inference smoothing.
+# Validation, best-checkpoint selection, and submission all use EMA weights
+# starting from `ema_start_epoch`. Typical gains: +0.3–0.8 QWK on small data.
+use_ema: true
+ema_decay: 0.999
+ema_start_epoch: 5

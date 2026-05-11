@@ -86,11 +86,30 @@ def a2_ordinal_loss(
     labels: torch.Tensor,
     pos_weight: torch.Tensor | None = None,
     label_smoothing: float = 0.0,
+    focal_gamma: float = 0.0,
 ) -> torch.Tensor:
+    """Per-threshold ordinal BCE with optional focal modulation.
+
+    focal_gamma > 0 down-weights easy examples (well-predicted thresholds) so
+    the gradient concentrates on hard ones — useful for the high-severity
+    tails (k=2) where v5 sees per-item QWK ceilings around 0.32 even though
+    pos_weight is already large. Default 0.0 == standard BCE.
+    """
     targets = A2OrdinalHead.build_ordinal_targets(labels, n_thresholds=logits.size(-1))
     if label_smoothing > 0.0:
         targets = targets * (1.0 - label_smoothing) + 0.5 * label_smoothing
-    return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
+    if focal_gamma <= 0.0:
+        return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
+
+    # Focal: (1 - p_t)^gamma * BCE, where p_t is the prob assigned to the true
+    # label. We compute BCE per element so the modulator stays per-element.
+    bce = F.binary_cross_entropy_with_logits(
+        logits, targets, pos_weight=pos_weight, reduction="none"
+    )
+    p = torch.sigmoid(logits)
+    p_t = targets * p + (1.0 - targets) * (1.0 - p)
+    modulator = (1.0 - p_t).clamp(min=1e-6).pow(focal_gamma)
+    return (modulator * bce).mean()
 
 
 def cumulative_to_class_probs(cum_logits: torch.Tensor) -> torch.Tensor:
@@ -195,16 +214,21 @@ def a2_combined_loss(
     emd_weight: float = 0.0,
     soft_label_sigma: float = 1.0,
     emd_norm: int = 2,
+    focal_gamma: float = 0.0,
 ) -> torch.Tensor:
-    """A2 loss combining ordinal BCE + Gaussian soft-label CE + EMD.
+    """A2 loss combining ordinal BCE (optionally focal) + Gaussian soft-label CE + EMD.
 
-    Setting soft_ce_weight=0 and emd_weight=0 reproduces a2_ordinal_loss exactly.
+    Setting soft_ce_weight=0, emd_weight=0, focal_gamma=0 reproduces
+    a2_ordinal_loss exactly.
     """
     total: torch.Tensor | float = 0.0
 
     if bce_weight > 0.0:
         total = total + bce_weight * a2_ordinal_loss(
-            logits, labels, pos_weight=pos_weight, label_smoothing=label_smoothing
+            logits, labels,
+            pos_weight=pos_weight,
+            label_smoothing=label_smoothing,
+            focal_gamma=focal_gamma,
         )
 
     if soft_ce_weight > 0.0:

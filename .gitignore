@@ -37,3 +37,8 @@ checkpoints/
 
 # Local env files
 .env
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+*.pyo
