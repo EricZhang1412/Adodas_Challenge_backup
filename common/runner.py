@@ -55,6 +55,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--manifest_dir", type=str, default=None)
     p.add_argument("--output_dir", type=str, default=None)
 
+    # K-fold CV. When --fold is given, train.csv/val.csv are replaced with
+    # manifest_dir/cv{n_folds}/train_fold_{fold}.csv and val_fold_{fold}.csv.
+    # Generate the cv{N}/ directory first via scripts/make_cv_folds.py.
+    p.add_argument("--fold", type=int, default=None,
+                   help="CV fold index (0-based). Requires --n_folds.")
+    p.add_argument("--n_folds", type=int, default=None,
+                   help="CV total fold count (matches the cv{N} subdirectory).")
+
     p.add_argument("--audio_features", nargs="+", default=None)
     p.add_argument("--video_features", nargs="+", default=None)
     p.add_argument("--core_audio", nargs="+", default=None)
@@ -868,6 +876,32 @@ def main() -> None:
     output_root = Path(cfg.get("output_dir", "/media/k3nwong/Data1/test/train/output"))
     manifest_dir = Path(cfg.get("manifest_dir", "/media/k3nwong/Data1/test/outputs/data"))
 
+    # Resolve train/val manifest paths. With CV: cv{N}/train_fold_{k}.csv etc.
+    # Without CV (default): the official train.csv / val.csv.
+    fold = cfg.get("fold")
+    n_folds = cfg.get("n_folds")
+    if (fold is None) ^ (n_folds is None):
+        raise ValueError(
+            "--fold and --n_folds must be specified together (or both omitted). "
+            f"Got fold={fold}, n_folds={n_folds}."
+        )
+    if fold is not None:
+        if fold < 0 or fold >= n_folds:
+            raise ValueError(f"--fold must be in [0, {n_folds}), got {fold}.")
+        cv_dir = manifest_dir / f"cv{n_folds}"
+        train_manifest = cv_dir / f"train_fold_{fold}.csv"
+        val_manifest = cv_dir / f"val_fold_{fold}.csv"
+        if not train_manifest.exists() or not val_manifest.exists():
+            raise FileNotFoundError(
+                f"CV manifests not found:\n  {train_manifest}\n  {val_manifest}\n"
+                f"Generate them first:\n"
+                f"  python scripts/make_cv_folds.py --manifest_dir {manifest_dir} "
+                f"--n_folds {n_folds}"
+            )
+    else:
+        train_manifest = manifest_dir / "train.csv"
+        val_manifest = manifest_dir / "val.csv"
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = build_run_name(cfg, task, timestamp, training_mode="grouped_participant")
     run_dirs = setup_run_dirs(output_root, run_name)
@@ -895,11 +929,18 @@ def main() -> None:
     )
     log.info(f"Mask policy: {feat_cfg.mask_policy}")
 
+    if fold is not None:
+        log.info(
+            f"CV mode: fold {fold}/{n_folds}  "
+            f"train={train_manifest.relative_to(manifest_dir)}  "
+            f"val={val_manifest.relative_to(manifest_dir)}"
+        )
+
     train_ds = GroupedParticipantDataset(
-        manifest_dir / "train.csv", feat_cfg, split="train",
+        train_manifest, feat_cfg, split="train",
         session_drop_prob=cfg.get("session_drop_prob", 0.1),
     )
-    val_ds = GroupedParticipantDataset(manifest_dir / "val.csv", feat_cfg, split="val")
+    val_ds = GroupedParticipantDataset(val_manifest, feat_cfg, split="val")
 
     batch_size = cfg.get("batch_size", 64)
     num_workers = cfg.get("num_workers", 8)
@@ -963,7 +1004,7 @@ def main() -> None:
 
     use_coral = bool(cfg.get("use_coral", False))
     if task == "a1":
-        bias_init = _compute_bias_init_a1(manifest_dir / "train.csv")
+        bias_init = _compute_bias_init_a1(train_manifest)
         task_head = A1Head(bb_cfg.d_shared, bias_init=bias_init).to(device)
     else:
         if use_coral:
@@ -997,11 +1038,11 @@ def main() -> None:
     pos_weight_t = None
     if cfg.get("use_pos_weight", True):
         if task == "a1":
-            pw = _compute_pos_weight_a1(manifest_dir / "train.csv")
+            pw = _compute_pos_weight_a1(train_manifest)
             pos_weight_t = torch.tensor(pw, dtype=torch.float32, device=device)
             log.info(f"pos_weight [D/A/S]: {pw[0]:.2f} / {pw[1]:.2f} / {pw[2]:.2f}")
         else:
-            pos_weight_t = compute_a2_pos_weight(manifest_dir / "train.csv").to(device)
+            pos_weight_t = compute_a2_pos_weight(train_manifest).to(device)
             log.info(f"A2 pos_weight shape: {pos_weight_t.shape}")
 
     params = list(grouped_model.parameters()) + list(task_head.parameters())
@@ -1259,7 +1300,13 @@ def main() -> None:
     if bool(cfg.get("run_inference_after_train", False)):
         run_dirs["submissions"].mkdir(parents=True, exist_ok=True)
         for split_name in ("val", "test_hidden"):
-            manifest_path = manifest_dir / f"{split_name}.csv"
+            # In CV mode, "val" means this fold's held-out participants, not
+            # the official val.csv (which mixes participants across folds and
+            # would leak through the training set).
+            if split_name == "val" and fold is not None:
+                manifest_path = val_manifest
+            else:
+                manifest_path = manifest_dir / f"{split_name}.csv"
             if not manifest_path.exists():
                 continue
             ds = GroupedParticipantDataset(manifest_path, feat_cfg, split=split_name)

@@ -97,6 +97,12 @@ def build_run_name(
     seed = cfg.get("seed", 42)
     parts.append(f"seed{seed}")
 
+    # Embed CV fold info so K parallel runs don't collide in the same output_dir.
+    fold = cfg.get("fold")
+    n_folds = cfg.get("n_folds")
+    if fold is not None and n_folds is not None:
+        parts.append(f"cv{n_folds}-fold{fold}")
+
     parts.append(timestamp)
 
     return "__".join(parts)

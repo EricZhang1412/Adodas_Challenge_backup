@@ -11,13 +11,18 @@ import torch
 from torch.utils.data import DataLoader
 import yaml
 
+import numpy as np
+from tqdm import tqdm
+
 from common.data.dataset import FeatureConfig
 from common.data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
 from common.models.grouped_model import CORALHead, GroupedModel
 from common.models.heads import A1Head, A2OrdinalHead
 from common.models.mtcn_backbone import BackboneConfig, MTCNBackbone
 from common.runner import (
+    _decode_a2_logits,
     _normalize_decode_method,
+    _to_device,
     generate_submission_grouped,
     setup_logging,
 )
@@ -27,12 +32,26 @@ from common.utils.ckpt import load_checkpoint
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", required=True, choices=["a1", "a2"])
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--checkpoint", default=None,
+        help="Single checkpoint path or directory containing best.pt. "
+             "Mutually exclusive with --checkpoints.",
+    )
+    parser.add_argument(
+        "--checkpoints", default=None,
+        help="Comma-separated list of checkpoint paths/dirs for K-fold ensemble "
+             "inference. Raw logits are averaged across folds before decoding. "
+             "Calibration (decode method + A2 threshold offsets) is taken from "
+             "the FIRST checkpoint's run_dir.",
+    )
     parser.add_argument("--config", default=None)
     parser.add_argument("--split", default="test_hidden")
     parser.add_argument("--manifest", default=None)
     parser.add_argument("--output", default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (args.checkpoint is None) == (args.checkpoints is None):
+        parser.error("Pass exactly one of --checkpoint or --checkpoints.")
+    return args
 
 
 def load_config(config_path: str | None, checkpoint_path: Path) -> dict:
@@ -90,13 +109,84 @@ def resolve_checkpoint_path(checkpoint_arg: str) -> Path:
     return p
 
 
+@torch.no_grad()
+def _gather_inference_logits(
+    grouped_model: GroupedModel,
+    task_head: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    use_amp: bool,
+    submission_level: str,
+    desc: str,
+) -> tuple[list[str], list[str], torch.Tensor]:
+    """Forward pass returning (pids, sessions, raw_logits) without decoding.
+
+    Used for K-fold ensemble: we average logits across models *before* decoding
+    so the ordinal threshold calibration is applied on the smoothed signal.
+    Mirrors generate_submission_grouped's collection logic but stops short of
+    the decode step.
+    """
+    grouped_model.eval()
+    task_head.eval()
+
+    all_pids: list[str] = []
+    all_sessions: list[str] = []
+    all_logits: list[torch.Tensor] = []
+
+    for batch in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True):
+        flat_batch = _to_device(batch["flat_batch"], device)
+        session_valid = batch["session_valid"].to(device)
+        B = batch["n_participants"]
+
+        with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+            out = grouped_model(flat_batch, B, session_valid)
+            if submission_level == "participant":
+                logits = task_head(out["participant_repr"])
+            else:
+                logits = task_head(out["session_reprs"])
+
+        all_logits.append(logits.float().cpu())
+
+        if submission_level == "participant":
+            participant_ids = [str(pid) for pid in batch["anon_pids"]]
+            all_pids.extend(participant_ids)
+            all_sessions.extend(["participant"] * len(participant_ids))
+        else:
+            all_pids.extend(batch["flat_pids"])
+            all_sessions.extend(batch["flat_sessions"])
+
+    return all_pids, all_sessions, torch.cat(all_logits, dim=0)
+
+
 def main() -> None:
     args = parse_args()
-    checkpoint_path = resolve_checkpoint_path(args.checkpoint)
-    cfg = load_config(args.config, checkpoint_path)
+
+    # Resolve one or more checkpoint paths. The FIRST checkpoint owns the
+    # config, calibration, and log destination — its run_dir is the canonical
+    # one for this submission. All checkpoints must be config-compatible
+    # (same architecture); we don't validate this beyond letting torch.load
+    # complain on shape mismatch.
+    if args.checkpoint is not None:
+        checkpoint_paths = [resolve_checkpoint_path(args.checkpoint)]
+    else:
+        checkpoint_paths = [
+            resolve_checkpoint_path(p.strip())
+            for p in args.checkpoints.split(",")
+            if p.strip()
+        ]
+    if not checkpoint_paths:
+        raise ValueError("No checkpoints to evaluate.")
+
+    primary_checkpoint = checkpoint_paths[0]
+    cfg = load_config(args.config, primary_checkpoint)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    run_dir = checkpoint_path.parent.parent
+    run_dir = primary_checkpoint.parent.parent
     setup_logging(run_dir / "logs", f"infer_{args.task}")
+    if len(checkpoint_paths) > 1:
+        print(f"Ensemble mode: averaging logits across {len(checkpoint_paths)} checkpoints")
+        for i, p in enumerate(checkpoint_paths):
+            print(f"  [{i}] {p}")
+        print(f"Calibration source: {primary_checkpoint.parent.parent}")
 
     manifest_dir = Path(cfg.get("manifest_dir", "/media/k3nwong/Data1/test/outputs/data"))
     manifest_path = Path(args.manifest) if args.manifest else manifest_dir / f"{args.split}.csv"
@@ -197,28 +287,74 @@ def main() -> None:
         else:
             task_head = A2OrdinalHead(bb_cfg.d_shared).to(device)
 
-    state = load_checkpoint(checkpoint_path, grouped_model, optimizer=None)
-    task_head.load_state_dict(state["head_state_dict"])
-    grouped_model.eval()
-    task_head.eval()
-
     a1_biases, a2_offsets, selected_decode_method = load_calibration(run_dir, args.task)
     use_amp = bool(cfg.get("amp", True))
     submission_level = cfg.get("submission_level", "participant")
 
-    pids, sessions, preds = generate_submission_grouped(
-        grouped_model=grouped_model,
-        task_head=task_head,
-        loader=loader,
-        device=device,
-        task=args.task,
-        use_amp=use_amp,
-        desc=f"Infer {args.split}",
-        submission_level=submission_level,
-        a1_biases=None if a1_biases is None else a1_biases.to(device),
-        decode_method=selected_decode_method,
-        a2_threshold_offsets=None if a2_offsets is None else a2_offsets.to(device),
-    )
+    if len(checkpoint_paths) == 1:
+        # Single-model path — unchanged from before, decode happens inside
+        # generate_submission_grouped.
+        state = load_checkpoint(checkpoint_paths[0], grouped_model, optimizer=None)
+        task_head.load_state_dict(state["head_state_dict"])
+
+        pids, sessions, preds = generate_submission_grouped(
+            grouped_model=grouped_model,
+            task_head=task_head,
+            loader=loader,
+            device=device,
+            task=args.task,
+            use_amp=use_amp,
+            desc=f"Infer {args.split}",
+            submission_level=submission_level,
+            a1_biases=None if a1_biases is None else a1_biases.to(device),
+            decode_method=selected_decode_method,
+            a2_threshold_offsets=None if a2_offsets is None else a2_offsets.to(device),
+        )
+    else:
+        # Ensemble path — gather raw logits from each checkpoint, average,
+        # then decode once. ID order is determined by the loader (deterministic
+        # since shuffle=False), so per-fold logits align row-by-row.
+        logits_per_fold: list[torch.Tensor] = []
+        pids: list[str] = []
+        sessions: list[str] = []
+        for k, ckpt_path in enumerate(checkpoint_paths):
+            state = load_checkpoint(ckpt_path, grouped_model, optimizer=None)
+            task_head.load_state_dict(state["head_state_dict"])
+            fold_pids, fold_sessions, fold_logits = _gather_inference_logits(
+                grouped_model=grouped_model,
+                task_head=task_head,
+                loader=loader,
+                device=device,
+                use_amp=use_amp,
+                submission_level=submission_level,
+                desc=f"Infer fold {k}/{len(checkpoint_paths)}",
+            )
+            if not pids:
+                pids, sessions = fold_pids, fold_sessions
+            else:
+                # Cross-check that row order is consistent across folds. The
+                # loader is deterministic (shuffle=False), so this should hold;
+                # fail loudly if it doesn't (e.g., dataset filtering changed).
+                if fold_pids != pids:
+                    raise RuntimeError(
+                        f"Checkpoint {ckpt_path} produced a different participant "
+                        f"ordering than the first checkpoint — refusing to ensemble."
+                    )
+            logits_per_fold.append(fold_logits)
+
+        avg_logits = torch.stack(logits_per_fold, dim=0).mean(dim=0).to(device)
+
+        if args.task == "a1":
+            if a1_biases is not None:
+                avg_logits = avg_logits + a1_biases.to(device)
+            preds = torch.sigmoid(avg_logits).cpu().numpy()
+        else:
+            if a2_offsets is not None:
+                avg_logits = avg_logits + a2_offsets.to(device)
+            preds_t = _decode_a2_logits(
+                task_head, avg_logits, decode_method=selected_decode_method
+            )
+            preds = preds_t.cpu().numpy()
 
     manifest_df = pd.read_csv(manifest_path)
     out_schools = []
