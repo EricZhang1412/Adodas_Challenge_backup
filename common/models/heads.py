@@ -5,6 +5,56 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# DASS-21 subscale grouping. Index lists are 0-indexed into d01..d21.
+# Cutoffs are applied to 2 * sum(items in group) per the standard scoring rule.
+DASS21_GROUP_ITEMS: dict[str, list[int]] = {
+    "D": [2, 4, 9, 12, 15, 16, 20],   # items 3, 5, 10, 13, 16, 17, 21
+    "A": [1, 3, 6, 8, 14, 18, 19],    # items 2, 4, 7,  9, 15, 19, 20
+    "S": [0, 5, 7, 10, 11, 13, 17],   # items 1, 6, 8, 11, 12, 14, 18
+}
+DASS21_GROUP_CUTOFFS: dict[str, float] = {"D": 10.0, "A": 8.0, "S": 15.0}
+DASS21_GROUP_ORDER: tuple[str, ...] = ("D", "A", "S")
+
+
+def soft_dass21_indicators(
+    a2_logits: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Soft DASS-21 binary indicators (B, 3) in order [D, A, S].
+
+    For CORAL / cumulative-threshold logits z of shape (B, 21, 3),
+    E[Y_j] = sum_k sigmoid(z_{j,k}) lies in [0, 3]. Sum over the 7 items in
+    each subscale, then apply a sigmoid around the cutoff to get a
+    differentiable, bounded approximation of 1{2 * sum >= cutoff}.
+    """
+    if a2_logits.dim() != 3:
+        raise ValueError(f"a2_logits must be (B, n_items, n_thresholds); got {tuple(a2_logits.shape)}")
+    e_y = torch.sigmoid(a2_logits).sum(dim=-1)  # (B, 21)
+    inv_tau = 1.0 / max(float(temperature), 1e-6)
+    out = []
+    for g in DASS21_GROUP_ORDER:
+        idx = torch.as_tensor(DASS21_GROUP_ITEMS[g], device=e_y.device, dtype=torch.long)
+        s_g = e_y.index_select(-1, idx).sum(dim=-1)  # (B,)
+        out.append(torch.sigmoid((2.0 * s_g - DASS21_GROUP_CUTOFFS[g]) * inv_tau))
+    return torch.stack(out, dim=-1)  # (B, 3)
+
+
+def dass21_consistency_loss(
+    a1_logits: torch.Tensor,
+    a2_logits: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Asymmetric BCE that anchors the A1 head to A2-derived soft DASS targets.
+
+    Detaching the A2 side keeps the well-tuned ordinal head from being pulled
+    around by the much weaker A1 binary signal; gradients flow back through
+    the encoder only via the A1 head.
+    """
+    with torch.no_grad():
+        soft_targets = soft_dass21_indicators(a2_logits, temperature=temperature)
+    return F.binary_cross_entropy_with_logits(a1_logits, soft_targets)
+
+
 class A1Head(nn.Module):
 
     def __init__(self, d_in: int, bias_init: list[float] | None = None) -> None:

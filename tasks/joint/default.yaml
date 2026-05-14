@@ -1,0 +1,90 @@
+feature_root: /data/maluzhang-folder/datasets/AdoDAS_Challenge/features
+manifest_dir: /data/maluzhang-folder/datasets/AdoDAS_Challenge/manifests
+output_dir: ./output/joint
+
+feature_selection:
+  audio_features:
+    - mel_mfcc
+    - vad
+    - egemaps
+    - ssl_embed          # chinese-hubert-large (1024d)
+  video_features:
+    - headpose_geom
+    - face_behavior
+    - qc_stats
+    - vad_agg
+    - body_pose
+    - global_motion
+    - vision_ssl_embed   # dinov2-large (1024d)
+  audio_ssl_model_tag: chinese-hubert-large
+  video_ssl_model_tag: dinov2-large
+
+ssl_group_tags: {}
+vision_ssl_group_tags: {}
+
+mask_policy: and_core
+core_audio: [mel_mfcc, ssl_embed]
+core_video: [vision_ssl_embed, qc_stats]
+
+# Backbone shape (matches the locked-in A2 baseline).
+d_adapter: 64
+d_model: 256
+tcn_layers: 6
+tcn_kernel_size: 3
+asp_alpha: 0.5
+asp_beta: 0.5
+dropout: 0.2
+d_shared: 256
+
+use_cross_modal_attn: true
+cross_modal_heads: 8
+
+aggregator: attention
+use_coral: true
+
+# Joint multi-task loss (Option 3 = A1 BCE + A2 CORAL(+aux) + consistency).
+a1_loss_weight: 1.0
+a2_loss_weight: 1.0
+consistency_loss_weight: 0.3
+consistency_temperature: 1.0
+joint_primary_metric: mean      # one of: mean, geomean, qwk, f1
+
+# Session-level supervision weights — midpoint of single-task defaults
+# (A1 used 0.3, A2 used 0.5). Applied to A1 session BCE + A2 session combined.
+session_loss_weight: 0.4
+session_type_loss_weight: 0.15
+
+# Training schedule (mirrors a2/default.yaml).
+batch_size: 32
+lr: 0.0005
+weight_decay: 0.01
+warmup_epochs: 3
+epochs: 50
+seed: 42
+num_workers: 8
+amp: true
+preload: true
+grad_clip: 1.0
+use_pos_weight: true
+patience: 10
+submission_level: participant
+decode_method: auto
+label_smoothing: 0.05
+feature_noise_std: 0.01
+session_drop_prob: 0.1
+early_stop_metric: primary
+
+# A2 auxiliary loss terms (consumed inside a2_combined_loss).
+a2_soft_qwk_weight: 0.0
+a2_emd_weight: 0.0
+
+# Demographic/context aux supervision is OFF by default in joint mode to
+# keep the loss surface clean; enable explicitly if you want it.
+use_aux_supervision: false
+aux_loss_weight: 0.0
+aux_per_task_weights:
+  family_structure: 0.5
+  only_child: 0.5
+  parental_favoritism: 0.5
+  academic_change: 1.0
+  emotional_change: 1.5

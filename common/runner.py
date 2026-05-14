@@ -23,7 +23,13 @@ import yaml
 from .data.dataset import FeatureConfig, ITEM_COLS, A1_COLS
 from .data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
 from .models.mtcn_backbone import BackboneConfig, MTCNBackbone
-from .models.heads import A1Head, A2OrdinalHead, a1_loss, a2_combined_loss
+from .models.heads import (
+    A1Head,
+    A2OrdinalHead,
+    a1_loss,
+    a2_combined_loss,
+    dass21_consistency_loss,
+)
 from .models.grouped_model import AuxHead, GroupedModel, CORALHead
 from .data.dataset import AUX_NAMES
 from .utils.seed import seed_everything
@@ -48,7 +54,7 @@ class _RealtimeFileHandler(logging.FileHandler):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--task", type=str, required=True, choices=["a1", "a2"])
+    p.add_argument("--task", type=str, required=True, choices=["a1", "a2", "joint"])
     p.add_argument("--config", type=str, default="configs/default.yaml")
 
     p.add_argument("--feature_root", type=str, default=None)
@@ -112,6 +118,19 @@ def parse_args() -> argparse.Namespace:
                     help="1=enable participant-level auxiliary attribute supervision (training only)")
     p.add_argument("--aux_loss_weight", type=float, default=None,
                     help="Global lambda multiplied onto the summed aux CE loss")
+
+    # Joint A1+A2 multi-task knobs (only active when --task joint).
+    p.add_argument("--a1_loss_weight", type=float, default=None,
+                   help="Weight on A1 BCE in joint mode")
+    p.add_argument("--a2_loss_weight", type=float, default=None,
+                   help="Weight on A2 combined (CORAL+aux) loss in joint mode")
+    p.add_argument("--consistency_loss_weight", type=float, default=None,
+                   help="Weight on the DASS-21 consistency loss anchoring A1 to A2-derived targets")
+    p.add_argument("--consistency_temperature", type=float, default=None,
+                   help="Temperature tau of the soft DASS-21 sigmoid; higher = softer targets")
+    p.add_argument("--joint_primary_metric", type=str, default=None,
+                   choices=["mean", "geomean", "qwk", "f1"],
+                   help="How to combine A1 F1 and A2 QWK into the joint primary metric")
 
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
@@ -342,7 +361,7 @@ def compute_a2_pos_weight(manifest_path: Path, n_items=21, n_thresholds=3):
 
 def train_one_epoch_grouped(
     grouped_model: GroupedModel,
-    task_head: nn.Module,
+    task_head: nn.Module | None,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -366,15 +385,32 @@ def train_one_epoch_grouped(
     aux_head: AuxHead | None = None,
     aux_loss_weight: float = 0.0,
     aux_per_task_weights: dict[str, float] | None = None,
+    a1_head: nn.Module | None = None,
+    a2_head: nn.Module | None = None,
+    pos_weight_a1=None,
+    pos_weight_a2=None,
+    a1_loss_weight: float = 1.0,
+    a2_loss_weight: float = 1.0,
+    consistency_loss_weight: float = 0.3,
+    consistency_temperature: float = 1.0,
 ) -> float:
     grouped_model.train()
-    task_head.train()
+    if task == "joint":
+        assert a1_head is not None and a2_head is not None, "joint training needs both heads"
+        a1_head.train()
+        a2_head.train()
+    else:
+        assert task_head is not None, f"task_head required for task={task!r}"
+        task_head.train()
     if aux_head is not None:
         aux_head.train()
     total_loss = 0.0
     n_batches = 0
     aux_running: dict[str, float] = {n: 0.0 for n in AUX_NAMES}
     aux_running_total = 0.0
+    cons_running = 0.0
+    a1_running = 0.0
+    a2_running = 0.0
 
     desc = f"Train {epoch}/{epochs}"
     if best_metric >= 0:
@@ -397,40 +433,25 @@ def train_one_epoch_grouped(
 
         if task == "a1":
             targets = batch["participant_y_a1"].to(device)
-        else:
+        elif task == "a2":
             targets = batch["participant_y_a2"].to(device).long()
+        else:  # joint
+            targets_a1 = batch["participant_y_a1"].to(device)
+            targets_a2 = batch["participant_y_a2"].to(device).long()
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = grouped_model(flat_batch, B, session_valid)
             valid_session_mask = _flatten_valid_session_mask(session_valid)
             has_valid_sessions = bool(valid_session_mask.any().item())
 
-            p_logits = task_head(out["participant_repr"])
-            if task == "a1":
-                main_loss = a1_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
-            else:
-                main_loss = a2_combined_loss(
-                    p_logits,
-                    targets,
-                    pos_weight=pos_weight,
-                    label_smoothing=label_smoothing,
-                    soft_qwk_weight=a2_soft_qwk_weight,
-                    emd_weight=a2_emd_weight,
-                    expectation_weight=a2_expectation_loss_weight,
-                    expectation_distance_aware=a2_expectation_distance_aware,
-                    expectation_distance_power=a2_expectation_distance_power,
-                )
-
-            if has_valid_sessions:
-                s_logits = task_head(out["session_reprs"])[valid_session_mask]
+            if task != "joint":
+                p_logits = task_head(out["participant_repr"])
                 if task == "a1":
-                    s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3)[valid_session_mask]
-                    sess_loss = a1_loss(s_logits, s_targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
+                    main_loss = a1_loss(p_logits, targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
                 else:
-                    s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21)[valid_session_mask]
-                    sess_loss = a2_combined_loss(
-                        s_logits,
-                        s_targets,
+                    main_loss = a2_combined_loss(
+                        p_logits,
+                        targets,
                         pos_weight=pos_weight,
                         label_smoothing=label_smoothing,
                         soft_qwk_weight=a2_soft_qwk_weight,
@@ -440,15 +461,95 @@ def train_one_epoch_grouped(
                         expectation_distance_power=a2_expectation_distance_power,
                     )
 
-                type_loss = F.cross_entropy(
-                    out["session_type_logits"][valid_session_mask],
-                    session_types[valid_session_mask],
-                )
-            else:
-                sess_loss = p_logits.new_zeros(())
-                type_loss = p_logits.new_zeros(())
+                if has_valid_sessions:
+                    s_logits = task_head(out["session_reprs"])[valid_session_mask]
+                    if task == "a1":
+                        s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3)[valid_session_mask]
+                        sess_loss = a1_loss(s_logits, s_targets, pos_weight=pos_weight, label_smoothing=label_smoothing)
+                    else:
+                        s_targets = targets.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21)[valid_session_mask]
+                        sess_loss = a2_combined_loss(
+                            s_logits,
+                            s_targets,
+                            pos_weight=pos_weight,
+                            label_smoothing=label_smoothing,
+                            soft_qwk_weight=a2_soft_qwk_weight,
+                            emd_weight=a2_emd_weight,
+                            expectation_weight=a2_expectation_loss_weight,
+                            expectation_distance_aware=a2_expectation_distance_aware,
+                            expectation_distance_power=a2_expectation_distance_power,
+                        )
 
-            loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss
+                    type_loss = F.cross_entropy(
+                        out["session_type_logits"][valid_session_mask],
+                        session_types[valid_session_mask],
+                    )
+                else:
+                    sess_loss = p_logits.new_zeros(())
+                    type_loss = p_logits.new_zeros(())
+
+                loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss
+            else:
+                # Joint A1+A2: both heads consume participant_repr / session_reprs.
+                a1_p_logits = a1_head(out["participant_repr"])
+                a2_p_logits = a2_head(out["participant_repr"])
+
+                main_a1 = a1_loss(
+                    a1_p_logits, targets_a1,
+                    pos_weight=pos_weight_a1, label_smoothing=label_smoothing,
+                )
+                main_a2 = a2_combined_loss(
+                    a2_p_logits, targets_a2,
+                    pos_weight=pos_weight_a2, label_smoothing=label_smoothing,
+                    soft_qwk_weight=a2_soft_qwk_weight,
+                    emd_weight=a2_emd_weight,
+                    expectation_weight=a2_expectation_loss_weight,
+                    expectation_distance_aware=a2_expectation_distance_aware,
+                    expectation_distance_power=a2_expectation_distance_power,
+                )
+                cons = dass21_consistency_loss(
+                    a1_p_logits, a2_p_logits, temperature=consistency_temperature
+                )
+
+                if has_valid_sessions:
+                    a1_s_logits = a1_head(out["session_reprs"])[valid_session_mask]
+                    a2_s_logits = a2_head(out["session_reprs"])[valid_session_mask]
+                    a1_s_targets = targets_a1.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3)[valid_session_mask]
+                    a2_s_targets = targets_a2.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21)[valid_session_mask]
+                    a1_sess_loss = a1_loss(
+                        a1_s_logits, a1_s_targets,
+                        pos_weight=pos_weight_a1, label_smoothing=label_smoothing,
+                    )
+                    a2_sess_loss = a2_combined_loss(
+                        a2_s_logits, a2_s_targets,
+                        pos_weight=pos_weight_a2, label_smoothing=label_smoothing,
+                        soft_qwk_weight=a2_soft_qwk_weight,
+                        emd_weight=a2_emd_weight,
+                        expectation_weight=a2_expectation_loss_weight,
+                        expectation_distance_aware=a2_expectation_distance_aware,
+                        expectation_distance_power=a2_expectation_distance_power,
+                    )
+                    type_loss = F.cross_entropy(
+                        out["session_type_logits"][valid_session_mask],
+                        session_types[valid_session_mask],
+                    )
+                else:
+                    a1_sess_loss = a1_p_logits.new_zeros(())
+                    a2_sess_loss = a1_p_logits.new_zeros(())
+                    type_loss = a1_p_logits.new_zeros(())
+
+                loss = (
+                    a1_loss_weight * main_a1
+                    + a2_loss_weight * main_a2
+                    + consistency_loss_weight * cons
+                    + session_loss_weight * (a1_sess_loss + a2_sess_loss)
+                    + session_type_loss_weight * type_loss
+                )
+
+                cons_running += float(cons.detach().item())
+                a1_running += float(main_a1.detach().item())
+                a2_running += float(main_a2.detach().item())
+                p_logits = a1_p_logits  # for aux block below (only used to .new_zeros)
 
             if aux_head is not None and aux_loss_weight > 0.0:
                 aux_labels = batch["participant_aux_labels"].to(device)
@@ -464,7 +565,14 @@ def train_one_epoch_grouped(
                     aux_running[k] += v
 
         optimizer.zero_grad()
-        clip_params = list(grouped_model.parameters()) + list(task_head.parameters())
+        if task == "joint":
+            clip_params = (
+                list(grouped_model.parameters())
+                + list(a1_head.parameters())
+                + list(a2_head.parameters())
+            )
+        else:
+            clip_params = list(grouped_model.parameters()) + list(task_head.parameters())
         if aux_head is not None:
             clip_params = clip_params + list(aux_head.parameters())
 
@@ -489,13 +597,19 @@ def train_one_epoch_grouped(
         per_task_avg = {k: v / n_batches for k, v in aux_running.items()}
         per_task_str = " ".join(f"{k}={v:.3f}" for k, v in per_task_avg.items())
         log.info(f"    aux loss avg={avg_aux_total:.4f} | {per_task_str}")
+    if task == "joint" and n_batches > 0:
+        log.info(
+            f"    joint loss avg: a1={a1_running / n_batches:.4f}  "
+            f"a2={a2_running / n_batches:.4f}  "
+            f"cons={cons_running / n_batches:.4f}"
+        )
     return total_loss / max(n_batches, 1)
 
 
 @torch.no_grad()
 def validate_grouped(
     grouped_model: GroupedModel,
-    task_head: nn.Module,
+    task_head: nn.Module | None,
     loader: DataLoader,
     device: torch.device,
     task: str,
@@ -507,10 +621,25 @@ def validate_grouped(
     a2_soft_qwk_weight: float = 0.0,
     a2_emd_weight: float = 0.0,
     aux_head: AuxHead | None = None,
+    a1_head: nn.Module | None = None,
+    a2_head: nn.Module | None = None,
+    pos_weight_a1=None,
+    pos_weight_a2=None,
+    a1_loss_weight: float = 1.0,
+    a2_loss_weight: float = 1.0,
+    consistency_loss_weight: float = 0.3,
+    consistency_temperature: float = 1.0,
+    joint_primary_metric: str = "mean",
 ):
     """Validate grouped model. Returns metrics dict."""
     grouped_model.eval()
-    task_head.eval()
+    if task == "joint":
+        assert a1_head is not None and a2_head is not None, "joint validate needs both heads"
+        a1_head.eval()
+        a2_head.eval()
+    else:
+        assert task_head is not None, f"task_head required for task={task!r}"
+        task_head.eval()
     if aux_head is not None:
         aux_head.eval()
     decode_method = _normalize_decode_method(decode_method)
@@ -520,6 +649,12 @@ def validate_grouped(
     all_labels = []
     all_logits = []
     all_sess_preds = []
+    # Joint-only buffers (kept empty for single-task paths)
+    all_a1_probs: list[np.ndarray] = []
+    all_a1_logits: list[np.ndarray] = []
+    all_a1_labels: list[np.ndarray] = []
+    all_a2_logits_joint: list[torch.Tensor] = []
+    all_a2_labels_joint: list[np.ndarray] = []
     aux_correct: dict[str, int] = {n: 0 for n in AUX_NAMES}
     aux_seen: dict[str, int] = {n: 0 for n in AUX_NAMES}
 
@@ -530,24 +665,45 @@ def validate_grouped(
 
         if task == "a1":
             targets = batch["participant_y_a1"].to(device)
-        else:
+        elif task == "a2":
             targets = batch["participant_y_a2"].to(device).long()
+        else:  # joint
+            targets_a1 = batch["participant_y_a1"].to(device)
+            targets_a2 = batch["participant_y_a2"].to(device).long()
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = grouped_model(flat_batch, B, session_valid)
-            p_logits = task_head(out["participant_repr"])
-            if task == "a1":
-                loss = a1_loss(p_logits, targets, pos_weight=pos_weight)
+            if task != "joint":
+                p_logits = task_head(out["participant_repr"])
+                if task == "a1":
+                    loss = a1_loss(p_logits, targets, pos_weight=pos_weight)
+                else:
+                    loss = a2_combined_loss(
+                        p_logits,
+                        targets,
+                        pos_weight=pos_weight,
+                        soft_qwk_weight=a2_soft_qwk_weight,
+                        emd_weight=a2_emd_weight,
+                    )
+                s_logits = task_head(out["session_reprs"])
             else:
-                loss = a2_combined_loss(
-                    p_logits,
-                    targets,
-                    pos_weight=pos_weight,
+                a1_p_logits = a1_head(out["participant_repr"])
+                a2_p_logits = a2_head(out["participant_repr"])
+                main_a1 = a1_loss(a1_p_logits, targets_a1, pos_weight=pos_weight_a1)
+                main_a2 = a2_combined_loss(
+                    a2_p_logits, targets_a2,
+                    pos_weight=pos_weight_a2,
                     soft_qwk_weight=a2_soft_qwk_weight,
                     emd_weight=a2_emd_weight,
                 )
-
-            s_logits = task_head(out["session_reprs"])
+                cons = dass21_consistency_loss(
+                    a1_p_logits, a2_p_logits, temperature=consistency_temperature
+                )
+                loss = (
+                    a1_loss_weight * main_a1
+                    + a2_loss_weight * main_a2
+                    + consistency_loss_weight * cons
+                )
 
             if aux_head is not None:
                 aux_labels = batch["participant_aux_labels"].to(device)
@@ -571,13 +727,20 @@ def validate_grouped(
 
             s_probs = torch.sigmoid(s_logits.float()).cpu().numpy()
             all_sess_preds.append(s_probs)
-        else:
+        elif task == "a2":
             if decode_method == "auto":
                 all_logits.append(p_logits.float().cpu())
             else:
                 preds = _decode_a2_logits(task_head, p_logits, decode_method=decode_method)
                 all_preds.append(preds.cpu().numpy())
             all_labels.append(targets.cpu().numpy())
+        else:  # joint
+            a1_logits_f = a1_p_logits.float()
+            all_a1_probs.append(torch.sigmoid(a1_logits_f).cpu().numpy())
+            all_a1_logits.append(a1_logits_f.cpu().numpy())
+            all_a1_labels.append(targets_a1.cpu().numpy())
+            all_a2_logits_joint.append(a2_p_logits.float().cpu())
+            all_a2_labels_joint.append(targets_a2.cpu().numpy())
 
         total_loss += loss.item()
         n_batches += 1
@@ -592,6 +755,69 @@ def validate_grouped(
             else:
                 parts.append(f"{name}=na")
         log.info(f"    aux acc: {' '.join(parts)}")
+
+    if task == "joint":
+        a1_probs_np = np.concatenate(all_a1_probs)
+        a1_labels_np = np.concatenate(all_a1_labels)
+        a1_logits_np = np.concatenate(all_a1_logits)
+        mf1 = binary_f1(a1_probs_np, a1_labels_np, threshold=0.5)
+        auroc = macro_auroc(a1_probs_np, a1_labels_np)
+        pcf1 = per_class_f1(a1_probs_np, a1_labels_np, threshold=0.5)
+        cal_biases, cal_pcf1 = calibrate_a1_bias(a1_logits_np, a1_labels_np)
+        cal_logits_np = a1_logits_np + cal_biases.reshape(1, -1)
+        cal_probs_np = 1.0 / (1.0 + np.exp(-cal_logits_np))
+        cal_mf1 = binary_f1(cal_probs_np, a1_labels_np, threshold=0.5)
+        a1_primary = float(max(mf1, cal_mf1))
+
+        a2_labels_np = np.concatenate(all_a2_labels_joint)
+        a2_logits_t = torch.cat(all_a2_logits_joint, dim=0)
+        a2_decode_used = None
+        if decode_method == "auto":
+            raw_results = _evaluate_a2_decode_candidates(
+                a2_head, a2_logits_t, a2_labels_np,
+                decode_methods=["argmax", "monotonic", "expectation"],
+            )
+            a2_decode_used, best_result = _select_best_a2_result(raw_results)
+            a2_preds = best_result["preds"]
+            a2_primary = float(best_result["qwk"])
+            a2_mae = float(best_result["mae"])
+        else:
+            a2_preds = _decode_a2_logits(a2_head, a2_logits_t, decode_method=decode_method).numpy()
+            a2_decode_used = decode_method
+            a2_primary = mean_qwk(a2_preds, a2_labels_np)
+            a2_mae = mean_mae(a2_preds, a2_labels_np)
+
+        if joint_primary_metric == "qwk":
+            combined = a2_primary
+        elif joint_primary_metric == "f1":
+            combined = a1_primary
+        elif joint_primary_metric == "geomean":
+            combined = float(np.sqrt(max(a1_primary, 0.0) * max(a2_primary, 0.0)))
+        else:  # mean
+            combined = 0.5 * (a1_primary + a2_primary)
+
+        log.info(
+            f"    A1: F1={mf1:.4f} (cal={cal_mf1:.4f}) AUROC={auroc:.4f} "
+            f"per_class=[{pcf1[0]:.3f}/{pcf1[1]:.3f}/{pcf1[2]:.3f}] | "
+            f"A2: QWK={a2_primary:.4f} MAE={a2_mae:.4f} decode={a2_decode_used} | "
+            f"primary({joint_primary_metric})={combined:.4f}"
+        )
+
+        return {
+            "loss": avg_loss,
+            "mean_f1": mf1,
+            "mean_f1_calibrated": cal_mf1,
+            "auroc": auroc,
+            "pcf1": pcf1,
+            "calibration_biases": cal_biases.tolist(),
+            "mean_qwk": a2_primary,
+            "mean_mae": a2_mae,
+            "selected_decode_method": a2_decode_used,
+            "primary_metric": combined,
+            "a1_primary": a1_primary,
+            "a2_primary": a2_primary,
+            "joint_primary_metric": joint_primary_metric,
+        }
 
     if task == "a1":
         probs_np = np.concatenate(all_preds)
@@ -1003,15 +1229,27 @@ def main() -> None:
     ).to(device)
 
     use_coral = bool(cfg.get("use_coral", False))
+    task_head: nn.Module | None = None
+    a1_head: nn.Module | None = None
+    a2_head: nn.Module | None = None
     if task == "a1":
         bias_init = _compute_bias_init_a1(train_manifest)
         task_head = A1Head(bb_cfg.d_shared, bias_init=bias_init).to(device)
-    else:
+    elif task == "a2":
         if use_coral:
             task_head = CORALHead(bb_cfg.d_shared).to(device)
             log.info("Using CORAL head for A2")
         else:
             task_head = A2OrdinalHead(bb_cfg.d_shared).to(device)
+    else:  # joint
+        bias_init = _compute_bias_init_a1(train_manifest)
+        a1_head = A1Head(bb_cfg.d_shared, bias_init=bias_init).to(device)
+        if use_coral:
+            a2_head = CORALHead(bb_cfg.d_shared).to(device)
+            log.info("Joint mode: A1Head + CORALHead")
+        else:
+            a2_head = A2OrdinalHead(bb_cfg.d_shared).to(device)
+            log.info("Joint mode: A1Head + A2OrdinalHead")
 
     use_aux_supervision = bool(cfg.get("use_aux_supervision", False))
     aux_loss_weight = float(cfg.get("aux_loss_weight", 0.0))
@@ -1024,7 +1262,12 @@ def main() -> None:
             f"per_task_weights={aux_per_task_weights or '{all 1.0}'}"
         )
 
-    n_params = sum(p.numel() for p in grouped_model.parameters()) + sum(p.numel() for p in task_head.parameters())
+    n_params = sum(p.numel() for p in grouped_model.parameters())
+    if task == "joint":
+        n_params += sum(p.numel() for p in a1_head.parameters())
+        n_params += sum(p.numel() for p in a2_head.parameters())
+    else:
+        n_params += sum(p.numel() for p in task_head.parameters())
     if aux_head is not None:
         n_params += sum(p.numel() for p in aux_head.parameters())
     log.info(f"Model params: {n_params:,}")
@@ -1036,16 +1279,31 @@ def main() -> None:
 
     grad_clip = cfg.get("grad_clip", 1.0)
     pos_weight_t = None
+    pos_weight_a1_t = None
+    pos_weight_a2_t = None
     if cfg.get("use_pos_weight", True):
         if task == "a1":
             pw = _compute_pos_weight_a1(train_manifest)
             pos_weight_t = torch.tensor(pw, dtype=torch.float32, device=device)
             log.info(f"pos_weight [D/A/S]: {pw[0]:.2f} / {pw[1]:.2f} / {pw[2]:.2f}")
-        else:
+        elif task == "a2":
             pos_weight_t = compute_a2_pos_weight(train_manifest).to(device)
             log.info(f"A2 pos_weight shape: {pos_weight_t.shape}")
+        else:  # joint
+            pw = _compute_pos_weight_a1(train_manifest)
+            pos_weight_a1_t = torch.tensor(pw, dtype=torch.float32, device=device)
+            pos_weight_a2_t = compute_a2_pos_weight(train_manifest).to(device)
+            log.info(f"Joint pos_weight A1 [D/A/S]: {pw[0]:.2f} / {pw[1]:.2f} / {pw[2]:.2f}")
+            log.info(f"Joint pos_weight A2 shape: {pos_weight_a2_t.shape}")
 
-    params = list(grouped_model.parameters()) + list(task_head.parameters())
+    if task == "joint":
+        params = (
+            list(grouped_model.parameters())
+            + list(a1_head.parameters())
+            + list(a2_head.parameters())
+        )
+    else:
+        params = list(grouped_model.parameters()) + list(task_head.parameters())
     if aux_head is not None:
         params = params + list(aux_head.parameters())
     optimizer = torch.optim.AdamW(
@@ -1077,18 +1335,40 @@ def main() -> None:
 
     a2_soft_qwk_weight = float(cfg.get("a2_soft_qwk_weight", 0.0))
     a2_emd_weight = float(cfg.get("a2_emd_weight", 0.0))
-    if task == "a2":
+    if task in ("a2", "joint"):
         log.info(f"A2 aux losses: soft_QWK weight={a2_soft_qwk_weight}, EMD weight={a2_emd_weight}")
 
+    # Joint-mode loss weights (no-op for single-task).
+    a1_loss_weight = float(cfg.get("a1_loss_weight", 1.0))
+    a2_loss_weight = float(cfg.get("a2_loss_weight", 1.0))
+    consistency_loss_weight = float(cfg.get("consistency_loss_weight", 0.3))
+    consistency_temperature = float(cfg.get("consistency_temperature", 1.0))
+    joint_primary_metric = str(cfg.get("joint_primary_metric", "mean"))
+    if joint_primary_metric not in {"mean", "geomean", "qwk", "f1"}:
+        raise ValueError(f"joint_primary_metric must be one of mean/geomean/qwk/f1, got {joint_primary_metric!r}")
+    if task == "joint":
+        log.info(
+            f"Joint loss weights: a1={a1_loss_weight} a2={a2_loss_weight} "
+            f"cons={consistency_loss_weight} tau={consistency_temperature} | "
+            f"primary={joint_primary_metric}"
+        )
+
     best_metric = -1.0
-    metric_name = "F1" if task == "a1" else "QWK"
+    if task == "a1":
+        metric_name = "F1"
+    elif task == "a2":
+        metric_name = "QWK"
+    else:
+        metric_name = f"joint-{joint_primary_metric}"
     t_start = time.time()
 
     log.info("=" * 90)
     if task == "a1":
         log.info("  Epoch  |    LR     | Train Loss | Val Loss | F1 raw | F1 sel |  AUROC | F1[D/A/S]       | Time")
-    else:
+    elif task == "a2":
         log.info("  Epoch  |    LR     | Train Loss | Val Loss | mean QWK | mean MAE | Time")
+    else:
+        log.info("  Epoch  |    LR     | Train Loss | Val Loss | F1 (cal) | QWK   | MAE   | primary | Time")
     log.info("=" * 90)
 
     for epoch in range(1, epochs + 1):
@@ -1108,6 +1388,14 @@ def main() -> None:
             aux_head=aux_head,
             aux_loss_weight=aux_loss_weight,
             aux_per_task_weights=aux_per_task_weights,
+            a1_head=a1_head,
+            a2_head=a2_head,
+            pos_weight_a1=pos_weight_a1_t,
+            pos_weight_a2=pos_weight_a2_t,
+            a1_loss_weight=a1_loss_weight,
+            a2_loss_weight=a2_loss_weight,
+            consistency_loss_weight=consistency_loss_weight,
+            consistency_temperature=consistency_temperature,
         )
 
         val_metrics = validate_grouped(
@@ -1117,6 +1405,15 @@ def main() -> None:
             a2_soft_qwk_weight=a2_soft_qwk_weight,
             a2_emd_weight=a2_emd_weight,
             aux_head=aux_head,
+            a1_head=a1_head,
+            a2_head=a2_head,
+            pos_weight_a1=pos_weight_a1_t,
+            pos_weight_a2=pos_weight_a2_t,
+            a1_loss_weight=a1_loss_weight,
+            a2_loss_weight=a2_loss_weight,
+            consistency_loss_weight=consistency_loss_weight,
+            consistency_temperature=consistency_temperature,
+            joint_primary_metric=joint_primary_metric,
         )
         scheduler.step()
 
@@ -1139,16 +1436,32 @@ def main() -> None:
                 f"{pcf1[0]:.3f}/{pcf1[1]:.3f}/{pcf1[2]:.3f} | "
                 f"{_fmt_duration(elapsed)} ETA {_fmt_duration(eta)} VRAM {vram_gb:.1f}G{marker}"
             )
-        else:
+        elif task == "a2":
             log.info(
                 f"  {epoch:3d}/{epochs:3d} | {lr_now:.2e} |   {train_loss:.4f}   |  {val_metrics['loss']:.4f}  | "
                 f" {val_metrics['mean_qwk']:.4f}  |  {val_metrics['mean_mae']:.4f}  | "
                 f"{_fmt_duration(elapsed)} ETA {_fmt_duration(eta)} VRAM {vram_gb:.1f}G{marker}"
             )
+        else:
+            cal_f1 = val_metrics.get("mean_f1_calibrated", val_metrics["mean_f1"])
+            log.info(
+                f"  {epoch:3d}/{epochs:3d} | {lr_now:.2e} |   {train_loss:.4f}   |  {val_metrics['loss']:.4f}  | "
+                f"{val_metrics['mean_f1']:.4f}({cal_f1:.4f}) | {val_metrics['mean_qwk']:.4f} | "
+                f"{val_metrics['mean_mae']:.4f} | {primary:.4f} | "
+                f"{_fmt_duration(elapsed)} ETA {_fmt_duration(eta)} VRAM {vram_gb:.1f}G{marker}"
+            )
 
         if is_best:
             best_metric = primary
-            ckpt_extra = {"head_state_dict": task_head.state_dict()}
+            if task == "joint":
+                ckpt_extra = {
+                    "head_state_dict": {
+                        "a1": a1_head.state_dict(),
+                        "a2": a2_head.state_dict(),
+                    }
+                }
+            else:
+                ckpt_extra = {"head_state_dict": task_head.state_dict()}
             if aux_head is not None:
                 ckpt_extra["aux_head_state_dict"] = aux_head.state_dict()
             save_checkpoint(
@@ -1170,12 +1483,21 @@ def main() -> None:
 
     log.info("Loading best checkpoint for submission generation ...")
     state = load_checkpoint(run_dirs["checkpoints"] / "best.pt", grouped_model, optimizer=None)
-    task_head.load_state_dict(state["head_state_dict"])
+    if task == "joint":
+        head_sd = state["head_state_dict"]
+        if not (isinstance(head_sd, dict) and {"a1", "a2"} <= set(head_sd.keys())):
+            raise RuntimeError("Joint checkpoint missing 'a1'/'a2' head_state_dict subkeys.")
+        a1_head.load_state_dict(head_sd["a1"])
+        a2_head.load_state_dict(head_sd["a2"])
+        a1_head.to(device)
+        a2_head.to(device)
+    else:
+        task_head.load_state_dict(state["head_state_dict"])
+        task_head.to(device)
     if aux_head is not None and "aux_head_state_dict" in state:
         aux_head.load_state_dict(state["aux_head_state_dict"])
         aux_head.to(device)
     grouped_model.to(device)
-    task_head.to(device)
 
     submission_level = cfg.get("submission_level", "participant")
     decode_method = _normalize_decode_method(cfg.get("decode_method", "expectation"))
@@ -1186,18 +1508,27 @@ def main() -> None:
     a2_offsets = None
     selected_decode_method = decode_method
 
-    if task == "a1":
+    # Pick the head to use for each calibration: in joint mode we have two heads;
+    # in single-task mode the loop only runs for the matching task.
+    a1_calib_head = a1_head if task == "joint" else task_head
+    a2_calib_head = a2_head if task == "joint" else task_head
+
+    if task in ("a1", "joint"):
         log.info("Calibrating per-task bias offsets on val ...")
         val_logits, val_labels = collect_val_logits_grouped_a1(
-            grouped_model, task_head, val_loader, device, use_amp,
+            grouped_model, a1_calib_head, val_loader, device, use_amp,
             submission_level=submission_level,
         )
         biases, cal_f1s = calibrate_a1_bias(val_logits, val_labels)
         for t, name in enumerate(["D", "A", "S"]):
             log.info(f"  {name}: bias={biases[t]:+.2f}  F1_cal={cal_f1s[t]:.4f}")
         cal_mean_f1 = float(np.mean(cal_f1s))
-        best_raw_f1 = float(meta.meta.get("best_metrics", {}).get("mean_f1", best_metric))
-        best_selected_f1 = float(meta.meta.get("best_metrics", {}).get("primary_metric", best_metric))
+        if task == "a1":
+            best_raw_f1 = float(meta.meta.get("best_metrics", {}).get("mean_f1", best_metric))
+            best_selected_f1 = float(meta.meta.get("best_metrics", {}).get("primary_metric", best_metric))
+        else:
+            best_raw_f1 = float(meta.meta.get("best_metrics", {}).get("mean_f1", 0.0))
+            best_selected_f1 = best_raw_f1
         log.info(
             f"  Mean calibrated F1: {cal_mean_f1:.4f} "
             f"(vs selected best: {best_selected_f1:.4f}, raw best: {best_raw_f1:.4f})"
@@ -1205,26 +1536,36 @@ def main() -> None:
         a1_biases = biases
         final_a1_metric = max(best_raw_f1, cal_mean_f1)
         final_a1_strategy = "bias_calibrated" if cal_mean_f1 >= best_raw_f1 else "raw"
-        meta.set_extra("final_selected_strategy", final_a1_strategy)
-        meta.set_extra("final_selected_metrics", {
-            "mean_f1": final_a1_metric,
-            "mean_f1_raw": best_raw_f1,
-            "mean_f1_calibrated": cal_mean_f1,
-            "auroc": meta.meta.get("best_metrics", {}).get("auroc"),
-        })
+        if task == "a1":
+            meta.set_extra("final_selected_strategy", final_a1_strategy)
+            meta.set_extra("final_selected_metrics", {
+                "mean_f1": final_a1_metric,
+                "mean_f1_raw": best_raw_f1,
+                "mean_f1_calibrated": cal_mean_f1,
+                "auroc": meta.meta.get("best_metrics", {}).get("auroc"),
+            })
+        else:
+            meta.set_extra("final_a1_strategy", final_a1_strategy)
+            meta.set_extra("final_a1_metrics", {
+                "mean_f1": final_a1_metric,
+                "mean_f1_raw": best_raw_f1,
+                "mean_f1_calibrated": cal_mean_f1,
+                "auroc": meta.meta.get("best_metrics", {}).get("auroc"),
+            })
 
         cal_data = {"biases": biases.tolist(), "cal_f1": cal_f1s, "mean_cal_f1": cal_mean_f1}
         with open(run_dirs["calibration"] / "a1_bias_grouped.json", "w") as f:
             json.dump(cal_data, f, indent=2)
-    else:
+
+    if task in ("a2", "joint"):
         log.info("Calibrating and selecting A2 decode strategy on val ...")
         val_logits, val_labels = collect_val_logits_grouped_a2(
-            grouped_model, task_head, val_loader, device, use_amp,
+            grouped_model, a2_calib_head, val_loader, device, use_amp,
             submission_level=submission_level,
         )
         val_labels_int = val_labels.astype(int)
         raw_results = _evaluate_a2_decode_candidates(
-            task_head,
+            a2_calib_head,
             torch.from_numpy(val_logits).float(),
             val_labels_int,
             decode_methods=["argmax", "monotonic", "expectation"],
@@ -1237,7 +1578,7 @@ def main() -> None:
                 decode_method=method,
             )
             preds = _decode_a2_logits(
-                task_head,
+                a2_calib_head,
                 torch.from_numpy(val_logits).float() + torch.as_tensor(offsets, dtype=torch.float32),
                 decode_method=method,
             ).cpu().numpy()
@@ -1271,12 +1612,20 @@ def main() -> None:
             f"(decode={selected_decode_method}, QWK={float(best_result['qwk']):.4f}, MAE={float(best_result['mae']):.4f})"
         )
 
-        meta.set_extra("final_selected_strategy", best_strategy)
-        meta.set_extra("final_selected_metrics", {
-            "mean_qwk": float(best_result["qwk"]),
-            "mean_mae": float(best_result["mae"]),
-            "decode_method": selected_decode_method,
-        })
+        if task == "a2":
+            meta.set_extra("final_selected_strategy", best_strategy)
+            meta.set_extra("final_selected_metrics", {
+                "mean_qwk": float(best_result["qwk"]),
+                "mean_mae": float(best_result["mae"]),
+                "decode_method": selected_decode_method,
+            })
+        else:
+            meta.set_extra("final_a2_strategy", best_strategy)
+            meta.set_extra("final_a2_metrics", {
+                "mean_qwk": float(best_result["qwk"]),
+                "mean_mae": float(best_result["mae"]),
+                "decode_method": selected_decode_method,
+            })
 
         cal_data = {
             "selected_strategy": best_strategy,
@@ -1299,6 +1648,12 @@ def main() -> None:
 
     if bool(cfg.get("run_inference_after_train", False)):
         run_dirs["submissions"].mkdir(parents=True, exist_ok=True)
+        # In joint mode we emit one CSV per head; otherwise just the single
+        # task's head. The tuple lists (head_task_label, head_module).
+        if task == "joint":
+            inference_heads = [("a1", a1_head), ("a2", a2_head)]
+        else:
+            inference_heads = [(task, task_head)]
         for split_name in ("val", "test_hidden"):
             # In CV mode, "val" means this fold's held-out participants, not
             # the official val.csv (which mixes participants across folds and
@@ -1315,77 +1670,79 @@ def main() -> None:
                 num_workers=num_workers, collate_fn=grouped_collate_fn,
             )
 
-            pids, sessions, preds = generate_submission_grouped(
-                grouped_model, task_head, loader, device, task, use_amp,
-                desc=f"Submit {split_name}",
-                submission_level=submission_level,
-                a1_biases=a1_biases,
-                decode_method=selected_decode_method,
-                a2_threshold_offsets=a2_offsets,
-            )
-
-            manifest_df = pd.read_csv(manifest_path)
-            file_ids = []
-            filtered_preds = []
-            if submission_level == "participant":
-                pid_to_info = {}
-                for _, row in manifest_df.iterrows():
-                    pid = str(row["anon_pid"])
-                    pid_to_info.setdefault(pid, (str(row["anon_school"]), str(row["anon_class"])))
-
-                for pid, pred in zip(pids, preds):
-                    pid_str = str(pid)
-                    info = pid_to_info.get(pid_str)
-                    if info is None:
-                        continue
-                    school, cls = info
-                    file_ids.append(f"{school}_{cls}_{pid_str}")
-                    filtered_preds.append(pred)
-                expected_rows = int(manifest_df["anon_pid"].astype(str).nunique())
-            else:
-                pid_to_info = {}
-                for _, row in manifest_df.iterrows():
-                    pid_to_info[(str(row["anon_pid"]), str(row["session"]))] = (
-                        str(row["anon_school"]), str(row["anon_class"])
-                    )
-
-                for pid, sess, pred in zip(pids, sessions, preds):
-                    key = (str(pid), str(sess))
-                    info = pid_to_info.get(key)
-                    if info is None:
-                        continue
-                    school, cls = info
-                    file_ids.append(f"{school}_{cls}_{key[0]}_{key[1]}")
-                    filtered_preds.append(pred)
-                expected_rows = len(manifest_df)
-
-            if filtered_preds:
-                preds = np.asarray(filtered_preds)
-            elif task == "a1":
-                preds = np.zeros((0, 3), dtype=np.float32)
-            else:
-                preds = np.zeros((0, 21), dtype=np.int64)
-            if len(file_ids) != expected_rows:
-                log.warning(
-                    f"Submission row count mismatch for {split_name}: expected={expected_rows} generated={len(file_ids)}"
+            for head_task, head_module in inference_heads:
+                pids, sessions, preds = generate_submission_grouped(
+                    grouped_model, head_module, loader, device, head_task, use_amp,
+                    desc=f"Submit {split_name} ({head_task})",
+                    submission_level=submission_level,
+                    a1_biases=a1_biases,
+                    decode_method=selected_decode_method,
+                    a2_threshold_offsets=a2_offsets,
                 )
 
-            if task == "a1":
-                sub = pd.DataFrame({
-                    "file_id": file_ids,
-                    "p_D": preds[:, 0],
-                    "p_A": preds[:, 1],
-                    "p_S": preds[:, 2],
-                })
-            else:
-                item_cols = [f"d{i:02d}" for i in range(1, 22)]
-                sub = pd.DataFrame({"file_id": file_ids})
-                for j, col in enumerate(item_cols):
-                    sub[col] = preds[:, j]
+                manifest_df = pd.read_csv(manifest_path)
+                file_ids = []
+                filtered_preds = []
+                if submission_level == "participant":
+                    pid_to_info = {}
+                    for _, row in manifest_df.iterrows():
+                        pid = str(row["anon_pid"])
+                        pid_to_info.setdefault(pid, (str(row["anon_school"]), str(row["anon_class"])))
 
-            out_path = run_dirs["submissions"] / f"submission_{task}_{split_name}.csv"
-            sub.to_csv(out_path, index=False)
-            log.info(f"Wrote {len(sub)} rows to {out_path}")
+                    for pid, pred in zip(pids, preds):
+                        pid_str = str(pid)
+                        info = pid_to_info.get(pid_str)
+                        if info is None:
+                            continue
+                        school, cls = info
+                        file_ids.append(f"{school}_{cls}_{pid_str}")
+                        filtered_preds.append(pred)
+                    expected_rows = int(manifest_df["anon_pid"].astype(str).nunique())
+                else:
+                    pid_to_info = {}
+                    for _, row in manifest_df.iterrows():
+                        pid_to_info[(str(row["anon_pid"]), str(row["session"]))] = (
+                            str(row["anon_school"]), str(row["anon_class"])
+                        )
+
+                    for pid, sess, pred in zip(pids, sessions, preds):
+                        key = (str(pid), str(sess))
+                        info = pid_to_info.get(key)
+                        if info is None:
+                            continue
+                        school, cls = info
+                        file_ids.append(f"{school}_{cls}_{key[0]}_{key[1]}")
+                        filtered_preds.append(pred)
+                    expected_rows = len(manifest_df)
+
+                if filtered_preds:
+                    preds = np.asarray(filtered_preds)
+                elif head_task == "a1":
+                    preds = np.zeros((0, 3), dtype=np.float32)
+                else:
+                    preds = np.zeros((0, 21), dtype=np.int64)
+                if len(file_ids) != expected_rows:
+                    log.warning(
+                        f"Submission row count mismatch for {split_name} ({head_task}): "
+                        f"expected={expected_rows} generated={len(file_ids)}"
+                    )
+
+                if head_task == "a1":
+                    sub = pd.DataFrame({
+                        "file_id": file_ids,
+                        "p_D": preds[:, 0],
+                        "p_A": preds[:, 1],
+                        "p_S": preds[:, 2],
+                    })
+                else:
+                    item_cols = [f"d{i:02d}" for i in range(1, 22)]
+                    sub = pd.DataFrame({"file_id": file_ids})
+                    for j, col in enumerate(item_cols):
+                        sub[col] = preds[:, j]
+
+                out_path = run_dirs["submissions"] / f"submission_{head_task}_{split_name}.csv"
+                sub.to_csv(out_path, index=False)
+                log.info(f"Wrote {len(sub)} rows to {out_path}")
     else:
         log.info("Skipping submission generation after training; use infer.py for release inference.")
 
