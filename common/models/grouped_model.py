@@ -168,6 +168,77 @@ class AuxHead(nn.Module):
         return total, per_task
 
 
+class AuxFiLM(nn.Module):
+    """FiLM modulation conditioned on 5 demographic auxiliary attributes.
+
+    Each attribute uses Embedding(n_classes + 1, d_embed); index = n_classes
+    is reserved as a MISSING slot. Embeddings are concatenated and mapped via
+    a 2-layer MLP to (gamma, beta), both in R^{d_shared}. We apply a residual
+    FiLM: fused = x * (1 + gamma) + beta. The last linear is zero-initialized
+    so fused == x at the start of training (identity warmup), avoiding any
+    perturbation of an already-tuned backbone until the FiLM branch learns.
+    """
+
+    def __init__(
+        self,
+        d_shared: int,
+        d_embed: int = 16,
+        hidden: int = 128,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        self.names: list[str] = list(AUX_NAMES)
+        self.d_shared = d_shared
+        self.embeds = nn.ModuleDict({
+            name: nn.Embedding(AUX_SCHEMA[name]["n_classes"] + 1, d_embed)
+            for name in self.names
+        })
+        self.missing_idx: dict[str, int] = {
+            name: AUX_SCHEMA[name]["n_classes"] for name in self.names
+        }
+        total_in = d_embed * len(self.names)
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(total_in),
+            nn.Linear(total_in, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 2 * d_shared),
+        )
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def fill_missing(self, aux_indices: torch.Tensor, aux_masks: torch.Tensor) -> torch.Tensor:
+        """Where aux_masks is False, replace the index with this attr's MISSING slot."""
+        out = aux_indices.clone().long()
+        for i, name in enumerate(self.names):
+            miss = self.missing_idx[name]
+            out[..., i] = torch.where(
+                aux_masks[..., i],
+                out[..., i],
+                torch.full_like(out[..., i], miss),
+            )
+        return out
+
+    def _gamma_beta(self, aux_indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        embeds = [self.embeds[name](aux_indices[..., i]) for i, name in enumerate(self.names)]
+        h = torch.cat(embeds, dim=-1)
+        gb = self.mlp(h)
+        gamma, beta = gb.chunk(2, dim=-1)
+        return gamma, beta
+
+    def forward(self, x: torch.Tensor, aux_indices: torch.Tensor) -> torch.Tensor:
+        """Modulate x by aux_indices.
+
+        x : (..., d_shared)  — typically (B, d_shared) or (B*4, d_shared)
+        aux_indices : matching leading dims, last dim = len(AUX_NAMES). Long.
+        """
+        gamma, beta = self._gamma_beta(aux_indices)
+        while gamma.dim() < x.dim():
+            gamma = gamma.unsqueeze(-2)
+            beta = beta.unsqueeze(-2)
+        return x * (1.0 + gamma) + beta
+
+
 class CORALHead(nn.Module):
 
     def __init__(self, d_in: int, n_items: int = 21, n_thresholds: int = 3):

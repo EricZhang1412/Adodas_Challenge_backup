@@ -1,6 +1,6 @@
 feature_root: /data/maluzhang-folder/datasets/AdoDAS_Challenge/features
 manifest_dir: /data/maluzhang-folder/datasets/AdoDAS_Challenge/manifests
-output_dir: ./output/joint-with-aux-supervision-tiny
+output_dir: ./output/joint-with-aux-supervision-tiny-film
 
 feature_selection:
   audio_features:
@@ -78,8 +78,9 @@ early_stop_metric: primary
 a2_soft_qwk_weight: 0.0
 a2_emd_weight: 0.0
 
-# Demographic/context aux supervision is OFF by default in joint mode to
-# keep the loss surface clean; enable explicitly if you want it.
+# Demographic/context aux: AuxHead supervises the 5 attributes, and AuxFiLM
+# below conditions the A1/A2 heads on (GT in training, predicted at inference)
+# aux labels — the concept-bottleneck setup.
 use_aux_supervision: true
 aux_loss_weight: 0.1
 aux_per_task_weights:
@@ -88,3 +89,21 @@ aux_per_task_weights:
   parental_favoritism: 0.5
   academic_change: 1.0
   emotional_change: 1.5
+
+# Concept-Bottleneck FiLM injection at participant_repr (joint-only).
+# AuxFiLM produces (γ, β) from the 5 embedded aux attributes and modulates the
+# repr fed to A1Head/A2Head via fused = x * (1 + γ) + β. The last linear is
+# zero-initialized so fused == x at the start of training (identity warmup).
+use_aux_film: true
+aux_film_d_embed: 16
+aux_film_hidden: 128
+aux_film_dropout: 0.2
+
+# Scheduled sampling for the GT → predicted-aux transition during training.
+# p_gt linearly anneals from p_start to p_end over the first
+# (epochs * anneal_until_frac) epochs, then holds at p_end. Validation and
+# inference always use predicted aux (mirroring deployment).
+aux_teacher_p_start: 1.0
+aux_teacher_p_end: 0.3
+aux_teacher_anneal_until_frac: 0.7
+aux_sampling_mode: per_attr     # per_attr / per_sample / batch

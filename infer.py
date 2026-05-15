@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from common.data.dataset import FeatureConfig
 from common.data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
-from common.models.grouped_model import CORALHead, GroupedModel
+from common.models.grouped_model import AuxFiLM, AuxHead, CORALHead, GroupedModel
 from common.models.heads import A1Head, A2OrdinalHead
 from common.models.mtcn_backbone import BackboneConfig, MTCNBackbone
 from common.runner import (
@@ -182,11 +182,21 @@ def _gather_inference_logits_joint(
     use_amp: bool,
     submission_level: str,
     desc: str,
+    aux_head: AuxHead | None = None,
+    aux_film: AuxFiLM | None = None,
 ) -> tuple[list[str], list[str], torch.Tensor, torch.Tensor]:
-    """Joint ensemble helper: one backbone forward, both heads tapped."""
+    """Joint ensemble helper: one backbone forward, both heads tapped.
+
+    If aux_head and aux_film are both given, the repr fed to a1/a2 heads is
+    aux-FiLM-modulated using predicted aux indices.
+    """
     grouped_model.eval()
     a1_head.eval()
     a2_head.eval()
+    if aux_head is not None:
+        aux_head.eval()
+    if aux_film is not None:
+        aux_film.eval()
 
     all_pids: list[str] = []
     all_sessions: list[str] = []
@@ -200,9 +210,21 @@ def _gather_inference_logits_joint(
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = grouped_model(flat_batch, B, session_valid)
-            repr_key = "participant_repr" if submission_level == "participant" else "session_reprs"
-            a1_logits = a1_head(out[repr_key])
-            a2_logits = a2_head(out[repr_key])
+            if aux_head is not None and aux_film is not None:
+                aux_logits = aux_head(out["participant_repr"])
+                pred_idx = torch.stack(
+                    [aux_logits[name].argmax(dim=-1) for name in aux_film.names], dim=-1
+                )
+                if submission_level == "participant":
+                    repr_for_head = aux_film(out["participant_repr"], pred_idx)
+                else:
+                    pred_idx_s = pred_idx.unsqueeze(1).expand(-1, 4, -1).reshape(B * 4, -1)
+                    repr_for_head = aux_film(out["session_reprs"], pred_idx_s)
+            else:
+                repr_key = "participant_repr" if submission_level == "participant" else "session_reprs"
+                repr_for_head = out[repr_key]
+            a1_logits = a1_head(repr_for_head)
+            a2_logits = a2_head(repr_for_head)
 
         a1_chunks.append(a1_logits.float().cpu())
         a2_chunks.append(a2_logits.float().cpu())
@@ -437,6 +459,24 @@ def main() -> None:
         a1_head = A1Head(bb_cfg.d_shared).to(device)
         a2_head = (CORALHead if use_coral else A2OrdinalHead)(bb_cfg.d_shared).to(device)
 
+    # AuxHead + AuxFiLM (joint-only). The heads are only instantiated when
+    # configured in the YAML, and the checkpoint must contain matching state.
+    aux_head: AuxHead | None = None
+    aux_film: AuxFiLM | None = None
+    if args.task == "joint" and bool(cfg.get("use_aux_supervision", False)):
+        aux_head = AuxHead(bb_cfg.d_shared, dropout=cfg.get("dropout", 0.2)).to(device)
+    if args.task == "joint" and bool(cfg.get("use_aux_film", False)):
+        if aux_head is None:
+            raise RuntimeError(
+                "use_aux_film=true at inference requires use_aux_supervision=true."
+            )
+        aux_film = AuxFiLM(
+            d_shared=bb_cfg.d_shared,
+            d_embed=int(cfg.get("aux_film_d_embed", 16)),
+            hidden=int(cfg.get("aux_film_hidden", 128)),
+            dropout=float(cfg.get("aux_film_dropout", 0.2)),
+        ).to(device)
+
     a1_biases, a2_offsets, selected_decode_method = load_calibration(run_dir, args.task)
     use_amp = bool(cfg.get("amp", True))
     submission_level = cfg.get("submission_level", "participant")
@@ -465,6 +505,16 @@ def main() -> None:
             sub_sd = head_sd[target_task] if joint_layout else head_sd
             task_head.load_state_dict(sub_sd)
 
+        if aux_head is not None and "aux_head_state_dict" in state:
+            aux_head.load_state_dict(state["aux_head_state_dict"])
+        if aux_film is not None:
+            if "aux_film_state_dict" not in state:
+                raise RuntimeError(
+                    "use_aux_film=true but checkpoint missing aux_film_state_dict; "
+                    "the saved best.pt was trained without AuxFiLM."
+                )
+            aux_film.load_state_dict(state["aux_film_state_dict"])
+
     if len(checkpoint_paths) == 1:
         # Single-model path — decode happens inside generate_submission_grouped.
         state = load_checkpoint(checkpoint_paths[0], grouped_model, optimizer=None)
@@ -492,6 +542,8 @@ def main() -> None:
                 a1_biases=None if biases is None else biases.to(device),
                 decode_method=selected_decode_method,
                 a2_threshold_offsets=None if offsets is None else offsets.to(device),
+                aux_head=aux_head if args.task == "joint" else None,
+                aux_film=aux_film if args.task == "joint" else None,
             )
             # Honor --output only when running a single head.
             explicit_out = Path(args.output) if args.output and len(head_jobs) == 1 else None
@@ -530,6 +582,8 @@ def main() -> None:
                     use_amp=use_amp,
                     submission_level=submission_level,
                     desc=f"Infer fold {k}/{len(checkpoint_paths)}",
+                    aux_head=aux_head,
+                    aux_film=aux_film,
                 )
                 if not pids:
                     pids, sessions = fold_pids, fold_sessions

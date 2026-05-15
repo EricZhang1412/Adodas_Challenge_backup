@@ -30,7 +30,7 @@ from .models.heads import (
     a2_combined_loss,
     dass21_consistency_loss,
 )
-from .models.grouped_model import AuxHead, GroupedModel, CORALHead
+from .models.grouped_model import AuxFiLM, AuxHead, GroupedModel, CORALHead
 from .data.dataset import AUX_NAMES
 from .utils.seed import seed_everything
 from .utils.metrics import binary_f1, macro_auroc, per_class_f1, mean_qwk, mean_mae, per_item_qwk
@@ -132,6 +132,28 @@ def parse_args() -> argparse.Namespace:
                    choices=["mean", "geomean", "qwk", "f1"],
                    help="How to combine A1 F1 and A2 QWK into the joint primary metric")
 
+    # Concept-bottleneck FiLM injection of demographic aux labels (joint-only).
+    # When enabled, AuxHead must also be on; AuxFiLM modulates participant_repr
+    # and session_reprs before A1Head/A2Head, using GT labels in training
+    # (with scheduled sampling to predicted) and predicted labels at inference.
+    p.add_argument("--use_aux_film", type=int, default=None,
+                   help="1=enable AuxFiLM injection (joint-only; requires use_aux_supervision=1)")
+    p.add_argument("--aux_film_d_embed", type=int, default=None,
+                   help="Per-attr embedding dim for AuxFiLM")
+    p.add_argument("--aux_film_hidden", type=int, default=None,
+                   help="Hidden width inside AuxFiLM MLP")
+    p.add_argument("--aux_film_dropout", type=float, default=None,
+                   help="Dropout inside AuxFiLM MLP")
+    p.add_argument("--aux_teacher_p_start", type=float, default=None,
+                   help="Scheduled sampling: initial probability of using GT aux labels")
+    p.add_argument("--aux_teacher_p_end", type=float, default=None,
+                   help="Scheduled sampling: final probability of using GT aux labels")
+    p.add_argument("--aux_teacher_anneal_until_frac", type=float, default=None,
+                   help="Fraction of total epochs over which p_gt linearly anneals from start to end")
+    p.add_argument("--aux_sampling_mode", type=str, default=None,
+                   choices=["per_attr", "per_sample", "batch"],
+                   help="Granularity of scheduled sampling")
+
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=None)
@@ -220,6 +242,46 @@ class EarlyStopping:
             return False
         self.counter += 1
         return self.counter >= self.patience
+
+
+def _aux_p_gt(epoch: int, total_epochs: int, p_start: float, p_end: float, anneal_frac: float) -> float:
+    """Linear anneal of teacher-forcing probability p_gt over [1, total*frac]."""
+    horizon = max(1.0, float(total_epochs) * float(anneal_frac))
+    progress = min(1.0, max(0.0, (epoch - 1) / horizon))
+    return float(p_start) + (float(p_end) - float(p_start)) * progress
+
+
+def _sample_aux_input(
+    aux_logits_dict: dict[str, torch.Tensor],
+    aux_film: AuxFiLM,
+    aux_labels: torch.Tensor,
+    aux_masks: torch.Tensor,
+    p_gt: float,
+    mode: str,
+) -> torch.Tensor:
+    """Choose aux_input_indices (B, n_aux) by per-attr/per-sample/batch scheduled sampling.
+
+    When use_gt is False or aux_masks is False, falls back to argmax(aux_logits).
+    Returns long tensor of valid indices in [0, n_classes) for each attr.
+    """
+    device = aux_labels.device
+    B, n_aux = aux_labels.shape
+    pred_idx = torch.stack(
+        [aux_logits_dict[name].argmax(dim=-1) for name in aux_film.names], dim=-1
+    ).long()
+
+    if mode == "per_sample":
+        sample_draw = torch.rand(B, 1, device=device) < p_gt
+        use_gt = sample_draw.expand(-1, n_aux)
+    elif mode == "batch":
+        batch_draw = (torch.rand((), device=device) < p_gt).item()
+        use_gt = torch.full((B, n_aux), bool(batch_draw), device=device)
+    else:  # per_attr (default)
+        use_gt = torch.rand(B, n_aux, device=device) < p_gt
+
+    use_gt = use_gt & aux_masks.bool()
+    aux_in = torch.where(use_gt, aux_labels.long(), pred_idx)
+    return aux_in
 
 
 def _to_device(obj, device):
@@ -393,6 +455,9 @@ def train_one_epoch_grouped(
     a2_loss_weight: float = 1.0,
     consistency_loss_weight: float = 0.3,
     consistency_temperature: float = 1.0,
+    aux_film: AuxFiLM | None = None,
+    aux_sampling_mode: str = "per_attr",
+    p_gt: float = 1.0,
 ) -> float:
     grouped_model.train()
     if task == "joint":
@@ -404,6 +469,8 @@ def train_one_epoch_grouped(
         task_head.train()
     if aux_head is not None:
         aux_head.train()
+    if aux_film is not None:
+        aux_film.train()
     total_loss = 0.0
     n_batches = 0
     aux_running: dict[str, float] = {n: 0.0 for n in AUX_NAMES}
@@ -490,9 +557,27 @@ def train_one_epoch_grouped(
 
                 loss = main_loss + session_loss_weight * sess_loss + session_type_loss_weight * type_loss
             else:
-                # Joint A1+A2: both heads consume participant_repr / session_reprs.
-                a1_p_logits = a1_head(out["participant_repr"])
-                a2_p_logits = a2_head(out["participant_repr"])
+                # Joint A1+A2. When AuxFiLM is enabled, fuse demographic
+                # conditioning into participant_repr / session_reprs *before*
+                # the A1/A2 heads. The same aux indices broadcast to all 4
+                # sessions of the same participant.
+                aux_logits_dict_cache: dict[str, torch.Tensor] | None = None
+                fused_p = out["participant_repr"]
+                fused_s = out["session_reprs"]
+                if aux_film is not None:
+                    aux_logits_dict_cache = aux_head(out["participant_repr"])
+                    aux_labels_b = batch["participant_aux_labels"].to(device)
+                    aux_masks_b = batch["participant_aux_masks"].to(device)
+                    aux_in = _sample_aux_input(
+                        aux_logits_dict_cache, aux_film,
+                        aux_labels_b, aux_masks_b, p_gt, aux_sampling_mode,
+                    )
+                    fused_p = aux_film(out["participant_repr"], aux_in)
+                    aux_in_s = aux_in.unsqueeze(1).expand(-1, 4, -1).reshape(B * 4, -1)
+                    fused_s = aux_film(out["session_reprs"], aux_in_s)
+
+                a1_p_logits = a1_head(fused_p)
+                a2_p_logits = a2_head(fused_p)
 
                 main_a1 = a1_loss(
                     a1_p_logits, targets_a1,
@@ -512,8 +597,8 @@ def train_one_epoch_grouped(
                 )
 
                 if has_valid_sessions:
-                    a1_s_logits = a1_head(out["session_reprs"])[valid_session_mask]
-                    a2_s_logits = a2_head(out["session_reprs"])[valid_session_mask]
+                    a1_s_logits = a1_head(fused_s)[valid_session_mask]
+                    a2_s_logits = a2_head(fused_s)[valid_session_mask]
                     a1_s_targets = targets_a1.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3)[valid_session_mask]
                     a2_s_targets = targets_a2.unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21)[valid_session_mask]
                     a1_sess_loss = a1_loss(
@@ -554,7 +639,12 @@ def train_one_epoch_grouped(
             if aux_head is not None and aux_loss_weight > 0.0:
                 aux_labels = batch["participant_aux_labels"].to(device)
                 aux_masks = batch["participant_aux_masks"].to(device)
-                aux_logits_dict = aux_head(out["participant_repr"])
+                # In joint+AuxFiLM we already called aux_head once above; reuse
+                # its logits instead of paying a second forward.
+                if task == "joint" and aux_film is not None and aux_logits_dict_cache is not None:
+                    aux_logits_dict = aux_logits_dict_cache
+                else:
+                    aux_logits_dict = aux_head(out["participant_repr"])
                 aux_loss, aux_per_task = aux_head.compute_loss(
                     aux_logits_dict, aux_labels, aux_masks, aux_per_task_weights
                 )
@@ -575,6 +665,8 @@ def train_one_epoch_grouped(
             clip_params = list(grouped_model.parameters()) + list(task_head.parameters())
         if aux_head is not None:
             clip_params = clip_params + list(aux_head.parameters())
+        if aux_film is not None:
+            clip_params = clip_params + list(aux_film.parameters())
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -630,6 +722,7 @@ def validate_grouped(
     consistency_loss_weight: float = 0.3,
     consistency_temperature: float = 1.0,
     joint_primary_metric: str = "mean",
+    aux_film: AuxFiLM | None = None,
 ):
     """Validate grouped model. Returns metrics dict."""
     grouped_model.eval()
@@ -642,6 +735,8 @@ def validate_grouped(
         task_head.eval()
     if aux_head is not None:
         aux_head.eval()
+    if aux_film is not None:
+        aux_film.eval()
     decode_method = _normalize_decode_method(decode_method)
     total_loss = 0.0
     n_batches = 0
@@ -687,8 +782,18 @@ def validate_grouped(
                     )
                 s_logits = task_head(out["session_reprs"])
             else:
-                a1_p_logits = a1_head(out["participant_repr"])
-                a2_p_logits = a2_head(out["participant_repr"])
+                # Always use predicted aux at validation (mirrors inference).
+                fused_p_val = out["participant_repr"]
+                aux_logits_dict_val: dict[str, torch.Tensor] | None = None
+                if aux_film is not None:
+                    aux_logits_dict_val = aux_head(out["participant_repr"])
+                    pred_idx_val = torch.stack(
+                        [aux_logits_dict_val[n].argmax(dim=-1) for n in aux_film.names],
+                        dim=-1,
+                    )
+                    fused_p_val = aux_film(out["participant_repr"], pred_idx_val)
+                a1_p_logits = a1_head(fused_p_val)
+                a2_p_logits = a2_head(fused_p_val)
                 main_a1 = a1_loss(a1_p_logits, targets_a1, pos_weight=pos_weight_a1)
                 main_a2 = a2_combined_loss(
                     a2_p_logits, targets_a2,
@@ -708,7 +813,10 @@ def validate_grouped(
             if aux_head is not None:
                 aux_labels = batch["participant_aux_labels"].to(device)
                 aux_masks = batch["participant_aux_masks"].to(device)
-                aux_logits_dict = aux_head(out["participant_repr"])
+                if task == "joint" and aux_film is not None and aux_logits_dict_val is not None:
+                    aux_logits_dict = aux_logits_dict_val
+                else:
+                    aux_logits_dict = aux_head(out["participant_repr"])
                 for i, name in enumerate(AUX_NAMES):
                     m = aux_masks[:, i]
                     n_valid = int(m.sum().item())
@@ -913,6 +1021,32 @@ def validate_grouped(
 
 
 @torch.no_grad()
+def _aux_fused_repr(
+    out: dict[str, torch.Tensor],
+    aux_head: AuxHead | None,
+    aux_film: AuxFiLM | None,
+    submission_level: str,
+    n_participants: int,
+) -> torch.Tensor:
+    """Pick the correct (possibly aux-FiLM-modulated) repr for downstream heads.
+
+    Always uses predicted aux indices (argmax of AuxHead) when aux_film is set.
+    """
+    if submission_level == "participant":
+        base = out["participant_repr"]
+    else:
+        base = out["session_reprs"]
+    if aux_head is None or aux_film is None:
+        return base
+    aux_logits = aux_head(out["participant_repr"])
+    pred_idx = torch.stack(
+        [aux_logits[name].argmax(dim=-1) for name in aux_film.names], dim=-1
+    )
+    if submission_level == "session":
+        pred_idx = pred_idx.unsqueeze(1).expand(-1, 4, -1).reshape(n_participants * 4, -1)
+    return aux_film(base, pred_idx)
+
+
 def generate_submission_grouped(
     grouped_model: GroupedModel,
     task_head: nn.Module,
@@ -925,9 +1059,15 @@ def generate_submission_grouped(
     a1_biases: np.ndarray | None = None,
     decode_method: str = "expectation",
     a2_threshold_offsets: np.ndarray | None = None,
+    aux_head: AuxHead | None = None,
+    aux_film: AuxFiLM | None = None,
 ):
     grouped_model.eval()
     task_head.eval()
+    if aux_head is not None:
+        aux_head.eval()
+    if aux_film is not None:
+        aux_film.eval()
     decode_method = _normalize_decode_method(decode_method)
     if submission_level not in {"participant", "session"}:
         raise ValueError("submission_level must be 'participant' or 'session'")
@@ -948,11 +1088,8 @@ def generate_submission_grouped(
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = grouped_model(flat_batch, B, session_valid)
-
-            if submission_level == "participant":
-                logits = task_head(out["participant_repr"])
-            else:
-                logits = task_head(out["session_reprs"])
+            repr_for_head = _aux_fused_repr(out, aux_head, aux_film, submission_level, B)
+            logits = task_head(repr_for_head)
 
         if task == "a1":
             logits_f = logits.float()
@@ -980,9 +1117,15 @@ def generate_submission_grouped(
 
 @torch.no_grad()
 def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_amp,
-                                   submission_level="participant"):
+                                   submission_level="participant",
+                                   aux_head: AuxHead | None = None,
+                                   aux_film: AuxFiLM | None = None):
     grouped_model.eval()
     task_head.eval()
+    if aux_head is not None:
+        aux_head.eval()
+    if aux_film is not None:
+        aux_film.eval()
     all_logits = []
     all_labels = []
     for batch in loader:
@@ -991,12 +1134,13 @@ def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_
         B = batch["n_participants"]
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = grouped_model(flat_batch, B, session_valid)
+            repr_for_head = _aux_fused_repr(out, aux_head, aux_film, submission_level, B)
             if submission_level == "participant":
-                logits = task_head(out["participant_repr"]).float().cpu().numpy()
+                logits = task_head(repr_for_head).float().cpu().numpy()
                 labels = batch["participant_y_a1"].numpy()
             else:
                 valid_session_mask = _flatten_valid_session_mask(session_valid).cpu().numpy()
-                logits = task_head(out["session_reprs"]).float().cpu().numpy()[valid_session_mask]
+                logits = task_head(repr_for_head).float().cpu().numpy()[valid_session_mask]
                 labels = batch["participant_y_a1"].unsqueeze(1).expand(-1, 4, -1).reshape(-1, 3).numpy()
                 labels = labels[valid_session_mask]
         all_logits.append(logits)
@@ -1006,10 +1150,16 @@ def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_
 
 @torch.no_grad()
 def collect_val_logits_grouped_a2(grouped_model, task_head, loader, device, use_amp,
-                                   submission_level="participant"):
+                                   submission_level="participant",
+                                   aux_head: AuxHead | None = None,
+                                   aux_film: AuxFiLM | None = None):
     """Collect A2 logits and labels from validation set for calibration."""
     grouped_model.eval()
     task_head.eval()
+    if aux_head is not None:
+        aux_head.eval()
+    if aux_film is not None:
+        aux_film.eval()
     all_logits = []
     all_labels = []
     for batch in loader:
@@ -1018,12 +1168,13 @@ def collect_val_logits_grouped_a2(grouped_model, task_head, loader, device, use_
         B = batch["n_participants"]
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = grouped_model(flat_batch, B, session_valid)
+            repr_for_head = _aux_fused_repr(out, aux_head, aux_film, submission_level, B)
             if submission_level == "participant":
-                logits = task_head(out["participant_repr"]).float().cpu().numpy()
+                logits = task_head(repr_for_head).float().cpu().numpy()
                 labels = batch["participant_y_a2"].numpy()
             else:
                 valid_session_mask = _flatten_valid_session_mask(session_valid).cpu().numpy()
-                logits = task_head(out["session_reprs"]).float().cpu().numpy()[valid_session_mask]
+                logits = task_head(repr_for_head).float().cpu().numpy()[valid_session_mask]
                 labels = batch["participant_y_a2"].unsqueeze(1).expand(-1, 4, -1).reshape(-1, 21).numpy()
                 labels = labels[valid_session_mask]
         all_logits.append(logits)
@@ -1262,6 +1413,30 @@ def main() -> None:
             f"per_task_weights={aux_per_task_weights or '{all 1.0}'}"
         )
 
+    use_aux_film = (task == "joint") and bool(cfg.get("use_aux_film", False))
+    aux_film: AuxFiLM | None = None
+    aux_sampling_mode = str(cfg.get("aux_sampling_mode", "per_attr"))
+    aux_teacher_p_start = float(cfg.get("aux_teacher_p_start", 1.0))
+    aux_teacher_p_end = float(cfg.get("aux_teacher_p_end", 0.3))
+    aux_teacher_anneal_until_frac = float(cfg.get("aux_teacher_anneal_until_frac", 0.7))
+    if use_aux_film:
+        if aux_head is None:
+            raise ValueError(
+                "use_aux_film=true requires use_aux_supervision=true and aux_loss_weight>0"
+            )
+        aux_film = AuxFiLM(
+            d_shared=bb_cfg.d_shared,
+            d_embed=int(cfg.get("aux_film_d_embed", 16)),
+            hidden=int(cfg.get("aux_film_hidden", 128)),
+            dropout=float(cfg.get("aux_film_dropout", 0.2)),
+        ).to(device)
+        log.info(
+            f"AuxFiLM ON: d_embed={cfg.get('aux_film_d_embed', 16)} "
+            f"hidden={cfg.get('aux_film_hidden', 128)} "
+            f"sampling={aux_sampling_mode} p_gt={aux_teacher_p_start}->{aux_teacher_p_end} "
+            f"anneal_until_frac={aux_teacher_anneal_until_frac}"
+        )
+
     n_params = sum(p.numel() for p in grouped_model.parameters())
     if task == "joint":
         n_params += sum(p.numel() for p in a1_head.parameters())
@@ -1270,6 +1445,8 @@ def main() -> None:
         n_params += sum(p.numel() for p in task_head.parameters())
     if aux_head is not None:
         n_params += sum(p.numel() for p in aux_head.parameters())
+    if aux_film is not None:
+        n_params += sum(p.numel() for p in aux_film.parameters())
     log.info(f"Model params: {n_params:,}")
 
     use_amp = bool(cfg.get("amp", True))
@@ -1306,6 +1483,8 @@ def main() -> None:
         params = list(grouped_model.parameters()) + list(task_head.parameters())
     if aux_head is not None:
         params = params + list(aux_head.parameters())
+    if aux_film is not None:
+        params = params + list(aux_film.parameters())
     optimizer = torch.optim.AdamW(
         params, lr=cfg.get("lr", 1e-3), weight_decay=cfg.get("weight_decay", 1e-2)
     )
@@ -1374,6 +1553,13 @@ def main() -> None:
     for epoch in range(1, epochs + 1):
         t0 = time.time()
 
+        cur_p_gt = _aux_p_gt(
+            epoch, epochs,
+            aux_teacher_p_start, aux_teacher_p_end, aux_teacher_anneal_until_frac,
+        )
+        if aux_film is not None:
+            log.info(f"  [Epoch {epoch}] aux scheduled-sampling p_gt={cur_p_gt:.3f}")
+
         train_loss = train_one_epoch_grouped(
             grouped_model, task_head, train_loader, optimizer, device,
             task, epoch, epochs, scaler, use_amp,
@@ -1396,6 +1582,9 @@ def main() -> None:
             a2_loss_weight=a2_loss_weight,
             consistency_loss_weight=consistency_loss_weight,
             consistency_temperature=consistency_temperature,
+            aux_film=aux_film,
+            aux_sampling_mode=aux_sampling_mode,
+            p_gt=cur_p_gt,
         )
 
         val_metrics = validate_grouped(
@@ -1414,6 +1603,7 @@ def main() -> None:
             consistency_loss_weight=consistency_loss_weight,
             consistency_temperature=consistency_temperature,
             joint_primary_metric=joint_primary_metric,
+            aux_film=aux_film,
         )
         scheduler.step()
 
@@ -1464,6 +1654,8 @@ def main() -> None:
                 ckpt_extra = {"head_state_dict": task_head.state_dict()}
             if aux_head is not None:
                 ckpt_extra["aux_head_state_dict"] = aux_head.state_dict()
+            if aux_film is not None:
+                ckpt_extra["aux_film_state_dict"] = aux_film.state_dict()
             save_checkpoint(
                 run_dirs["checkpoints"] / "best.pt",
                 grouped_model, optimizer, epoch, best_metric,
@@ -1497,6 +1689,14 @@ def main() -> None:
     if aux_head is not None and "aux_head_state_dict" in state:
         aux_head.load_state_dict(state["aux_head_state_dict"])
         aux_head.to(device)
+    if aux_film is not None:
+        if "aux_film_state_dict" not in state:
+            raise RuntimeError(
+                "use_aux_film=true but checkpoint is missing aux_film_state_dict; "
+                "the saved best.pt was produced without AuxFiLM."
+            )
+        aux_film.load_state_dict(state["aux_film_state_dict"])
+        aux_film.to(device)
     grouped_model.to(device)
 
     submission_level = cfg.get("submission_level", "participant")
@@ -1518,6 +1718,8 @@ def main() -> None:
         val_logits, val_labels = collect_val_logits_grouped_a1(
             grouped_model, a1_calib_head, val_loader, device, use_amp,
             submission_level=submission_level,
+            aux_head=aux_head if task == "joint" else None,
+            aux_film=aux_film if task == "joint" else None,
         )
         biases, cal_f1s = calibrate_a1_bias(val_logits, val_labels)
         for t, name in enumerate(["D", "A", "S"]):
@@ -1562,6 +1764,8 @@ def main() -> None:
         val_logits, val_labels = collect_val_logits_grouped_a2(
             grouped_model, a2_calib_head, val_loader, device, use_amp,
             submission_level=submission_level,
+            aux_head=aux_head if task == "joint" else None,
+            aux_film=aux_film if task == "joint" else None,
         )
         val_labels_int = val_labels.astype(int)
         raw_results = _evaluate_a2_decode_candidates(
@@ -1678,6 +1882,8 @@ def main() -> None:
                     a1_biases=a1_biases,
                     decode_method=selected_decode_method,
                     a2_threshold_offsets=a2_offsets,
+                    aux_head=aux_head if task == "joint" else None,
+                    aux_film=aux_film if task == "joint" else None,
                 )
 
                 manifest_df = pd.read_csv(manifest_path)
