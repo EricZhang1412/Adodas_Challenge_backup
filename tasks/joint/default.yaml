@@ -1,6 +1,6 @@
 feature_root: /data/maluzhang-folder/datasets/AdoDAS_Challenge/features
 manifest_dir: /data/maluzhang-folder/datasets/AdoDAS_Challenge/manifests
-output_dir: ./output/joint
+output_dir: ./output/joint-with-aux-supervision-tiny
 
 feature_selection:
   audio_features:
@@ -27,17 +27,17 @@ core_audio: [mel_mfcc, ssl_embed]
 core_video: [vision_ssl_embed, qc_stats]
 
 # Backbone shape (matches the locked-in A2 baseline).
-d_adapter: 64
-d_model: 256
-tcn_layers: 6
+d_adapter: 96
+d_model: 128
+tcn_layers: 4
 tcn_kernel_size: 3
 asp_alpha: 0.5
 asp_beta: 0.5
-dropout: 0.2
-d_shared: 256
+dropout: 0.3
+d_shared: 128
 
 use_cross_modal_attn: true
-cross_modal_heads: 8
+cross_modal_heads: 4
 
 aggregator: attention
 use_coral: true
@@ -56,10 +56,10 @@ session_type_loss_weight: 0.15
 
 # Training schedule (mirrors a2/default.yaml).
 batch_size: 32
-lr: 0.0005
-weight_decay: 0.01
+lr: 0.0008
+weight_decay: 0.05
 warmup_epochs: 3
-epochs: 50
+epochs: 30
 seed: 42
 num_workers: 8
 amp: true
@@ -70,7 +70,7 @@ patience: 10
 submission_level: participant
 decode_method: auto
 label_smoothing: 0.05
-feature_noise_std: 0.01
+feature_noise_std: 0.03
 session_drop_prob: 0.1
 early_stop_metric: primary
 
@@ -80,8 +80,8 @@ a2_emd_weight: 0.0
 
 # Demographic/context aux supervision is OFF by default in joint mode to
 # keep the loss surface clean; enable explicitly if you want it.
-use_aux_supervision: false
-aux_loss_weight: 0.0
+use_aux_supervision: true
+aux_loss_weight: 0.1
 aux_per_task_weights:
   family_structure: 0.5
   only_child: 0.5
