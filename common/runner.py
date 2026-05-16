@@ -1047,6 +1047,7 @@ def _aux_fused_repr(
     return aux_film(base, pred_idx)
 
 
+@torch.no_grad()
 def generate_submission_grouped(
     grouped_model: GroupedModel,
     task_head: nn.Module,
