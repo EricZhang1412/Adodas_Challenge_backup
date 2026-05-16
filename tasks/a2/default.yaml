@@ -60,14 +60,3 @@ label_smoothing: 0.05
 feature_noise_std: 0.01
 session_drop_prob: 0.1
 early_stop_metric: val_loss
-
-# Auxiliary attribute supervision (training-only).
-# Heads are not used at inference (they get loaded if present, but never called).
-use_aux_supervision: true
-aux_loss_weight: 0.1
-aux_per_task_weights:
-  family_structure: 0.5
-  only_child: 0.5
-  parental_favoritism: 0.5
-  academic_change: 1.0
-  emotional_change: 1.5
