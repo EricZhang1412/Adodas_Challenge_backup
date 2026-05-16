@@ -30,7 +30,7 @@ from .models.heads import (
     a2_combined_loss,
     dass21_consistency_loss,
 )
-from .models.grouped_model import AuxFiLM, GroupedModel, CORALHead
+from .models.grouped_model import AuxFiLM, AuxPredictor, GroupedModel, CORALHead
 from .utils.seed import seed_everything
 from .utils.metrics import binary_f1, macro_auroc, per_class_f1, mean_qwk, mean_mae, per_item_qwk
 from .utils.ckpt import save_checkpoint, load_checkpoint
@@ -626,8 +626,14 @@ def validate_grouped(
     consistency_temperature: float = 1.0,
     joint_primary_metric: str = "mean",
     aux_film: AuxFiLM | None = None,
+    aux_predictor: AuxPredictor | None = None,
+    aux_input_source: str = "gt",
 ):
-    """Validate grouped model. Returns metrics dict."""
+    """Validate grouped model. Returns metrics dict.
+
+    aux_input_source: "gt" uses manifest GT aux (training-style); "predictor"
+    uses AuxPredictor softmax probs via AuxFiLM.forward_soft (inference-style).
+    """
     grouped_model.eval()
     if task == "joint":
         assert a1_head is not None and a2_head is not None, "joint validate needs both heads"
@@ -638,6 +644,8 @@ def validate_grouped(
         task_head.eval()
     if aux_film is not None:
         aux_film.eval()
+    if aux_predictor is not None:
+        aux_predictor.eval()
     decode_method = _normalize_decode_method(decode_method)
     total_loss = 0.0
     n_batches = 0
@@ -681,14 +689,22 @@ def validate_grouped(
                     )
                 s_logits = task_head(out["session_reprs"])
             else:
-                # GT aux indices (MISSING slot when masked) drive AuxFiLM at
-                # validation, matching the training distribution exactly.
+                # AuxFiLM modulation: GT path (training-style) or predictor
+                # softmax path (inference-style), controlled by aux_input_source.
                 fused_p_val = out["participant_repr"]
                 if aux_film is not None:
-                    aux_labels_b = batch["participant_aux_labels"].to(device)
-                    aux_masks_b = batch["participant_aux_masks"].to(device)
-                    aux_in = aux_film.fill_missing(aux_labels_b, aux_masks_b)
-                    fused_p_val = aux_film(out["participant_repr"], aux_in)
+                    if aux_input_source == "gt":
+                        aux_labels_b = batch["participant_aux_labels"].to(device)
+                        aux_masks_b = batch["participant_aux_masks"].to(device)
+                        aux_in = aux_film.fill_missing(aux_labels_b, aux_masks_b)
+                        fused_p_val = aux_film(out["participant_repr"], aux_in)
+                    elif aux_input_source == "predictor":
+                        if aux_predictor is None:
+                            raise ValueError("validate_grouped with aux_input_source='predictor' requires aux_predictor")
+                        probs = aux_predictor.predict_probs(out["participant_repr"])
+                        fused_p_val = aux_film.forward_soft(out["participant_repr"], probs)
+                    else:
+                        raise ValueError(f"unknown aux_input_source: {aux_input_source!r}")
                 a1_p_logits = a1_head(fused_p_val)
                 a2_p_logits = a2_head(fused_p_val)
                 main_a1 = a1_loss(a1_p_logits, targets_a1, pos_weight=pos_weight_a1)
@@ -900,11 +916,18 @@ def _aux_fused_repr(
     aux_masks: torch.Tensor | None,
     submission_level: str,
     n_participants: int,
+    aux_predictor: AuxPredictor | None = None,
+    aux_input_source: str = "gt",
 ) -> torch.Tensor:
     """Pick the (possibly aux-FiLM-modulated) repr for downstream heads.
 
-    Uses GT aux indices (with MISSING slot filled in where ``aux_masks`` is
-    False) — identical to the training and validation paths.
+    aux_input_source:
+        "gt"        — use GT aux indices from manifest (with MISSING slot for
+                      masked attrs); mirrors training. Requires aux_labels,
+                      aux_masks.
+        "predictor" — softmax probs from AuxPredictor drive AuxFiLM via
+                      forward_soft. Used at inference when manifest has no
+                      aux columns. Requires aux_predictor.
     """
     if submission_level == "participant":
         base = out["participant_repr"]
@@ -912,12 +935,24 @@ def _aux_fused_repr(
         base = out["session_reprs"]
     if aux_film is None:
         return base
-    if aux_labels is None or aux_masks is None:
-        raise ValueError("aux_film is enabled but aux_labels/aux_masks were not provided")
-    aux_in = aux_film.fill_missing(aux_labels, aux_masks)
-    if submission_level == "session":
-        aux_in = aux_in.unsqueeze(1).expand(-1, 4, -1).reshape(n_participants * 4, -1)
-    return aux_film(base, aux_in)
+    if aux_input_source == "gt":
+        if aux_labels is None or aux_masks is None:
+            raise ValueError("aux_input_source='gt' requires aux_labels and aux_masks")
+        aux_in = aux_film.fill_missing(aux_labels, aux_masks)
+        if submission_level == "session":
+            aux_in = aux_in.unsqueeze(1).expand(-1, 4, -1).reshape(n_participants * 4, -1)
+        return aux_film(base, aux_in)
+    if aux_input_source == "predictor":
+        if aux_predictor is None:
+            raise ValueError("aux_input_source='predictor' requires aux_predictor")
+        probs = aux_predictor.predict_probs(out["participant_repr"])
+        if submission_level == "session":
+            probs = {
+                name: p.unsqueeze(1).expand(-1, 4, -1).reshape(n_participants * 4, -1)
+                for name, p in probs.items()
+            }
+        return aux_film.forward_soft(base, probs)
+    raise ValueError(f"unknown aux_input_source: {aux_input_source!r}")
 
 
 @torch.no_grad()
@@ -934,11 +969,15 @@ def generate_submission_grouped(
     decode_method: str = "expectation",
     a2_threshold_offsets: np.ndarray | None = None,
     aux_film: AuxFiLM | None = None,
+    aux_predictor: AuxPredictor | None = None,
+    aux_input_source: str = "gt",
 ):
     grouped_model.eval()
     task_head.eval()
     if aux_film is not None:
         aux_film.eval()
+    if aux_predictor is not None:
+        aux_predictor.eval()
     decode_method = _normalize_decode_method(decode_method)
     if submission_level not in {"participant", "session"}:
         raise ValueError("submission_level must be 'participant' or 'session'")
@@ -952,17 +991,19 @@ def generate_submission_grouped(
         else torch.as_tensor(a2_threshold_offsets, device=device, dtype=torch.float32)
     )
 
+    needs_gt = aux_film is not None and aux_input_source == "gt"
     for batch in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True):
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
-        aux_labels_b = batch["participant_aux_labels"].to(device) if aux_film is not None else None
-        aux_masks_b = batch["participant_aux_masks"].to(device) if aux_film is not None else None
+        aux_labels_b = batch["participant_aux_labels"].to(device) if needs_gt else None
+        aux_masks_b = batch["participant_aux_masks"].to(device) if needs_gt else None
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = grouped_model(flat_batch, B, session_valid)
             repr_for_head = _aux_fused_repr(
                 out, aux_film, aux_labels_b, aux_masks_b, submission_level, B,
+                aux_predictor=aux_predictor, aux_input_source=aux_input_source,
             )
             logits = task_head(repr_for_head)
 
@@ -993,23 +1034,29 @@ def generate_submission_grouped(
 @torch.no_grad()
 def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_amp,
                                    submission_level="participant",
-                                   aux_film: AuxFiLM | None = None):
+                                   aux_film: AuxFiLM | None = None,
+                                   aux_predictor: AuxPredictor | None = None,
+                                   aux_input_source: str = "gt"):
     grouped_model.eval()
     task_head.eval()
     if aux_film is not None:
         aux_film.eval()
+    if aux_predictor is not None:
+        aux_predictor.eval()
+    needs_gt = aux_film is not None and aux_input_source == "gt"
     all_logits = []
     all_labels = []
     for batch in loader:
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
-        aux_labels_b = batch["participant_aux_labels"].to(device) if aux_film is not None else None
-        aux_masks_b = batch["participant_aux_masks"].to(device) if aux_film is not None else None
+        aux_labels_b = batch["participant_aux_labels"].to(device) if needs_gt else None
+        aux_masks_b = batch["participant_aux_masks"].to(device) if needs_gt else None
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = grouped_model(flat_batch, B, session_valid)
             repr_for_head = _aux_fused_repr(
                 out, aux_film, aux_labels_b, aux_masks_b, submission_level, B,
+                aux_predictor=aux_predictor, aux_input_source=aux_input_source,
             )
             if submission_level == "participant":
                 logits = task_head(repr_for_head).float().cpu().numpy()
@@ -1027,24 +1074,30 @@ def collect_val_logits_grouped_a1(grouped_model, task_head, loader, device, use_
 @torch.no_grad()
 def collect_val_logits_grouped_a2(grouped_model, task_head, loader, device, use_amp,
                                    submission_level="participant",
-                                   aux_film: AuxFiLM | None = None):
+                                   aux_film: AuxFiLM | None = None,
+                                   aux_predictor: AuxPredictor | None = None,
+                                   aux_input_source: str = "gt"):
     """Collect A2 logits and labels from validation set for calibration."""
     grouped_model.eval()
     task_head.eval()
     if aux_film is not None:
         aux_film.eval()
+    if aux_predictor is not None:
+        aux_predictor.eval()
+    needs_gt = aux_film is not None and aux_input_source == "gt"
     all_logits = []
     all_labels = []
     for batch in loader:
         flat_batch = _to_device(batch["flat_batch"], device)
         session_valid = batch["session_valid"].to(device)
         B = batch["n_participants"]
-        aux_labels_b = batch["participant_aux_labels"].to(device) if aux_film is not None else None
-        aux_masks_b = batch["participant_aux_masks"].to(device) if aux_film is not None else None
+        aux_labels_b = batch["participant_aux_labels"].to(device) if needs_gt else None
+        aux_masks_b = batch["participant_aux_masks"].to(device) if needs_gt else None
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = grouped_model(flat_batch, B, session_valid)
             repr_for_head = _aux_fused_repr(
                 out, aux_film, aux_labels_b, aux_masks_b, submission_level, B,
+                aux_predictor=aux_predictor, aux_input_source=aux_input_source,
             )
             if submission_level == "participant":
                 logits = task_head(repr_for_head).float().cpu().numpy()

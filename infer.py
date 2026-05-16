@@ -16,7 +16,8 @@ from tqdm import tqdm
 
 from common.data.dataset import FeatureConfig
 from common.data.grouped_dataset import GroupedParticipantDataset, grouped_collate_fn
-from common.models.grouped_model import AuxFiLM, CORALHead, GroupedModel
+from common.data.dataset import AUX_NAMES, AUX_SCHEMA
+from common.models.grouped_model import AuxFiLM, AuxPredictor, CORALHead, GroupedModel
 from common.models.heads import A1Head, A2OrdinalHead
 from common.models.mtcn_backbone import BackboneConfig, MTCNBackbone
 from common.runner import (
@@ -48,6 +49,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="test_hidden")
     parser.add_argument("--manifest", default=None)
     parser.add_argument("--output", default=None)
+    parser.add_argument(
+        "--aux_input_source", default="auto",
+        choices=["auto", "gt", "predictor"],
+        help="How to feed AuxFiLM at inference. auto = decide per-run from "
+             "manifest aux columns (predictor if none present); gt = always "
+             "use manifest GT (errors if absent); predictor = always use "
+             "AuxPredictor softmax (requires aux_predictor_state_dict in ckpt).",
+    )
     args = parser.parse_args()
     if (args.checkpoint is None) == (args.checkpoints is None):
         parser.error("Pass exactly one of --checkpoint or --checkpoints.")
@@ -183,17 +192,21 @@ def _gather_inference_logits_joint(
     submission_level: str,
     desc: str,
     aux_film: AuxFiLM | None = None,
+    aux_predictor: AuxPredictor | None = None,
+    aux_input_source: str = "gt",
 ) -> tuple[list[str], list[str], torch.Tensor, torch.Tensor]:
     """Joint ensemble helper: one backbone forward, both heads tapped.
 
-    When ``aux_film`` is provided, the repr fed to a1/a2 heads is FiLM-modulated
-    by the GT aux indices from the manifest (MISSING slot for masked attrs).
+    aux_input_source = "gt" reads aux indices from the manifest; "predictor"
+    runs AuxPredictor and feeds softmax probs to AuxFiLM.forward_soft.
     """
     grouped_model.eval()
     a1_head.eval()
     a2_head.eval()
     if aux_film is not None:
         aux_film.eval()
+    if aux_predictor is not None:
+        aux_predictor.eval()
 
     all_pids: list[str] = []
     all_sessions: list[str] = []
@@ -207,7 +220,10 @@ def _gather_inference_logits_joint(
 
         with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
             out = grouped_model(flat_batch, B, session_valid)
-            if aux_film is not None:
+            if aux_film is None:
+                repr_key = "participant_repr" if submission_level == "participant" else "session_reprs"
+                repr_for_head = out[repr_key]
+            elif aux_input_source == "gt":
                 aux_labels_b = batch["participant_aux_labels"].to(device)
                 aux_masks_b = batch["participant_aux_masks"].to(device)
                 aux_in = aux_film.fill_missing(aux_labels_b, aux_masks_b)
@@ -216,9 +232,20 @@ def _gather_inference_logits_joint(
                 else:
                     aux_in_s = aux_in.unsqueeze(1).expand(-1, 4, -1).reshape(B * 4, -1)
                     repr_for_head = aux_film(out["session_reprs"], aux_in_s)
+            elif aux_input_source == "predictor":
+                if aux_predictor is None:
+                    raise RuntimeError("aux_input_source='predictor' requires aux_predictor")
+                probs = aux_predictor.predict_probs(out["participant_repr"])
+                if submission_level == "participant":
+                    repr_for_head = aux_film.forward_soft(out["participant_repr"], probs)
+                else:
+                    probs_s = {
+                        name: p.unsqueeze(1).expand(-1, 4, -1).reshape(B * 4, -1)
+                        for name, p in probs.items()
+                    }
+                    repr_for_head = aux_film.forward_soft(out["session_reprs"], probs_s)
             else:
-                repr_key = "participant_repr" if submission_level == "participant" else "session_reprs"
-                repr_for_head = out[repr_key]
+                raise ValueError(f"unknown aux_input_source: {aux_input_source!r}")
             a1_logits = a1_head(repr_for_head)
             a2_logits = a2_head(repr_for_head)
 
@@ -455,11 +482,13 @@ def main() -> None:
         a1_head = A1Head(bb_cfg.d_shared).to(device)
         a2_head = (CORALHead if use_coral else A2OrdinalHead)(bb_cfg.d_shared).to(device)
 
-    # AuxFiLM (joint-only). Instantiated when configured in the YAML; the
-    # checkpoint must contain matching aux_film_state_dict. GT aux indices
-    # from the manifest drive FiLM modulation at inference time, with the
-    # MISSING slot covering any masked attributes.
+    # AuxFiLM (joint-only). The matching aux_film_state_dict in the ckpt is
+    # required. At inference AuxFiLM is driven either by manifest GT indices
+    # (training-style) or by an AuxPredictor's softmax probs (when GT is
+    # unavailable). AuxPredictor weights live in aux_predictor_state_dict on
+    # ckpts produced by scripts/train_aux_predictor.py.
     aux_film: AuxFiLM | None = None
+    aux_predictor: AuxPredictor | None = None
     if args.task == "joint" and bool(cfg.get("use_aux_film", False)):
         aux_film = AuxFiLM(
             d_shared=bb_cfg.d_shared,
@@ -473,6 +502,26 @@ def main() -> None:
     submission_level = cfg.get("submission_level", "participant")
     manifest_df = pd.read_csv(manifest_path)
     submissions_dir = run_dir / "submissions"
+
+    # Decide aux input source for this run. "auto" inspects the manifest: if
+    # at least one aux column is present we trust the GT path; otherwise we
+    # fall back to the AuxPredictor softmax path.
+    aux_columns_in_manifest = {AUX_SCHEMA[k]["col"] for k in AUX_NAMES} & set(manifest_df.columns)
+    if args.task != "joint" or aux_film is None:
+        aux_input_source = "gt"  # ignored downstream when aux_film is None
+    elif args.aux_input_source == "auto":
+        aux_input_source = "gt" if aux_columns_in_manifest else "predictor"
+        print(
+            f"[infer] aux_input_source=auto -> {aux_input_source} "
+            f"({len(aux_columns_in_manifest)} aux column(s) found in manifest)"
+        )
+    else:
+        aux_input_source = args.aux_input_source
+        if aux_input_source == "gt" and not aux_columns_in_manifest:
+            raise RuntimeError(
+                "--aux_input_source=gt but the manifest has none of the 5 aux columns. "
+                "Use --aux_input_source predictor (requires aux_predictor_state_dict in ckpt) or auto."
+            )
 
     def _load_head_state(state: dict, target_task: str) -> None:
         """Resolve the head state_dict from a checkpoint and load it.
@@ -503,6 +552,24 @@ def main() -> None:
                     "the saved best.pt was trained without AuxFiLM."
                 )
             aux_film.load_state_dict(state["aux_film_state_dict"])
+        # AuxPredictor is optional: only present on ckpts produced by
+        # scripts/train_aux_predictor.py. We always instantiate from the
+        # ckpt's own config so embedding sizes match.
+        nonlocal aux_predictor
+        if aux_film is not None and "aux_predictor_state_dict" in state:
+            pred_cfg = state.get("aux_predictor_config") or {}
+            aux_predictor = AuxPredictor(
+                d_in=int(pred_cfg.get("d_in", bb_cfg.d_shared)),
+                hidden=int(pred_cfg.get("hidden", 128)),
+                dropout=float(pred_cfg.get("dropout", 0.2)),
+            ).to(device)
+            aux_predictor.load_state_dict(state["aux_predictor_state_dict"])
+        if aux_input_source == "predictor" and aux_predictor is None:
+            raise RuntimeError(
+                "aux_input_source='predictor' but the checkpoint has no "
+                "aux_predictor_state_dict. Run scripts/train_aux_predictor.py "
+                "first to produce best_with_predictor.pt."
+            )
 
     if len(checkpoint_paths) == 1:
         # Single-model path — decode happens inside generate_submission_grouped.
@@ -532,6 +599,8 @@ def main() -> None:
                 decode_method=selected_decode_method,
                 a2_threshold_offsets=None if offsets is None else offsets.to(device),
                 aux_film=aux_film if args.task == "joint" else None,
+                aux_predictor=aux_predictor if args.task == "joint" else None,
+                aux_input_source=aux_input_source,
             )
             # Honor --output only when running a single head.
             explicit_out = Path(args.output) if args.output and len(head_jobs) == 1 else None
@@ -571,6 +640,8 @@ def main() -> None:
                     submission_level=submission_level,
                     desc=f"Infer fold {k}/{len(checkpoint_paths)}",
                     aux_film=aux_film,
+                    aux_predictor=aux_predictor,
+                    aux_input_source=aux_input_source,
                 )
                 if not pids:
                     pids, sessions = fold_pids, fold_sessions

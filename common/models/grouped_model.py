@@ -166,6 +166,25 @@ class AuxFiLM(nn.Module):
         gamma, beta = gb.chunk(2, dim=-1)
         return gamma, beta
 
+    def _gamma_beta_from_probs(
+        self, probs_dict: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Soft path: per-attr probs (..., n_classes) → weighted embedding sum.
+
+        The MISSING slot (index n_classes) is intentionally excluded — softmax
+        comes from AuxPredictor and only spans the real classes, so the soft
+        embedding is the expected value of the discrete embedding under p.
+        """
+        embeds = []
+        for name in self.names:
+            n_cls = AUX_SCHEMA[name]["n_classes"]
+            p = probs_dict[name]
+            embeds.append(p @ self.embeds[name].weight[:n_cls])
+        h = torch.cat(embeds, dim=-1)
+        gb = self.mlp(h)
+        gamma, beta = gb.chunk(2, dim=-1)
+        return gamma, beta
+
     def forward(self, x: torch.Tensor, aux_indices: torch.Tensor) -> torch.Tensor:
         """Modulate x by aux_indices.
 
@@ -177,6 +196,80 @@ class AuxFiLM(nn.Module):
             gamma = gamma.unsqueeze(-2)
             beta = beta.unsqueeze(-2)
         return x * (1.0 + gamma) + beta
+
+    def forward_soft(
+        self, x: torch.Tensor, probs_dict: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Like forward() but conditioned on per-attr softmax distributions.
+
+        probs_dict[name] : (..., n_classes_name)  — softmax over real classes.
+        Leading dims must match x's leading dims (broadcast handled below).
+        """
+        gamma, beta = self._gamma_beta_from_probs(probs_dict)
+        while gamma.dim() < x.dim():
+            gamma = gamma.unsqueeze(-2)
+            beta = beta.unsqueeze(-2)
+        return x * (1.0 + gamma) + beta
+
+
+class AuxPredictor(nn.Module):
+    """Predict 5 demographic aux attributes from participant_repr.
+
+    Trained as a frozen-backbone probe (stage 2) so its outputs can replace
+    the manifest's GT aux labels at inference — softmax probs are then fed to
+    ``AuxFiLM.forward_soft`` for a smooth approximation of the GT hard input.
+    """
+
+    def __init__(self, d_in: int, hidden: int = 128, dropout: float = 0.2) -> None:
+        super().__init__()
+        self.names: list[str] = list(AUX_NAMES)
+        self.shared = nn.Sequential(
+            nn.LayerNorm(d_in),
+            nn.Linear(d_in, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.heads = nn.ModuleDict({
+            name: nn.Linear(hidden, AUX_SCHEMA[name]["n_classes"])
+            for name in self.names
+        })
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        h = self.shared(x)
+        return {name: head(h) for name, head in self.heads.items()}
+
+    def predict_probs(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {name: F.softmax(logits, dim=-1) for name, logits in self(x).items()}
+
+    def compute_loss(
+        self,
+        logits_dict: dict[str, torch.Tensor],
+        labels: torch.Tensor,
+        masks: torch.Tensor,
+        per_task_weights: dict[str, float] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Masked CE per attribute, summed with optional per-task weights.
+
+        labels : (B, len(AUX_NAMES)) long
+        masks  : (B, len(AUX_NAMES)) bool — True iff label is valid for sample
+        Returns (total_loss, {name: float} for logging).
+        """
+        device = labels.device
+        total = torch.zeros((), device=device)
+        per_task: dict[str, float] = {}
+        for i, name in enumerate(self.names):
+            m = masks[:, i]
+            n_valid = int(m.sum().item())
+            if n_valid == 0:
+                per_task[name] = 0.0
+                continue
+            logits = logits_dict[name][m]
+            tgt = labels[m, i]
+            ce = F.cross_entropy(logits, tgt)
+            w = float((per_task_weights or {}).get(name, 1.0))
+            total = total + w * ce
+            per_task[name] = float(ce.detach().item())
+        return total, per_task
 
 
 class CORALHead(nn.Module):

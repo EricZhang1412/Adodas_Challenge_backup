@@ -1,0 +1,41 @@
+# Stage-2 training config for AuxPredictor.
+#
+# Training requires --from_main_ckpt pointing to a stage-1 best.pt.
+# The script reads <main_ckpt run_dir>/config_used.yaml for feature_root,
+# manifest_dir, fold/n_folds, backbone hyper-params, and AuxFiLM hyper-params.
+# Only the knobs below are predictor-specific.
+
+# AuxPredictor architecture.
+predictor_hidden: 128
+predictor_dropout: 0.2
+
+# Optional per-attribute CE loss weights. Default = 1.0 each. Same names as
+# AUX_SCHEMA: family_structure / only_child / parental_favoritism /
+# academic_change / emotional_change.
+predictor_per_task_weights:
+  family_structure: 1.0
+  only_child: 1.0
+  parental_favoritism: 1.0
+  academic_change: 1.0
+  emotional_change: 1.0
+
+# Optimization.
+lr: 0.001
+weight_decay: 0.01
+batch_size: 32
+num_workers: 8
+preload: true
+amp: true
+grad_clip: 1.0
+seed: 42
+
+# Schedule.
+epochs: 20
+warmup_epochs: 2
+patience: 6
+# "macro_f1" averages per-attribute macro F1 on val. "loss" early-stops on
+# validation aux CE.
+early_stop_metric: macro_f1
+
+# Output ckpt filename written under <main run_dir>/checkpoints/.
+out_ckpt_name: best_with_predictor.pt
