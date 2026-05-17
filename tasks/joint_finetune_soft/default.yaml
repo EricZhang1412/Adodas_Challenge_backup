@@ -1,0 +1,30 @@
+# Stage-3 fine-tune: AuxFiLM + A1/A2 heads on top of a frozen stage-1 backbone
+# and frozen stage-2 AuxPredictor. Dual-path forward feeds both GT one-hot and
+# predictor softmax through AuxFiLM each batch, so AuxFiLM learns to handle
+# the soft distribution it will see at inference.
+#
+# Required input: --from_ckpt <run>/checkpoints/best_with_predictor.pt
+# Stage-1 hyper-params (backbone shape, aux_film shape, loss weights) are
+# read from <run>/config_used.yaml. Only the knobs below are stage-3 specific.
+
+# Dual-path loss weight on the GT one-hot branch; predictor branch gets 1-alpha.
+alpha: 0.3
+
+# Optimizer. lr defaults to stage-1 lr / 5.
+lr: 0.00016
+weight_decay: 0.05
+batch_size: 32
+num_workers: 8
+preload: true
+amp: true
+grad_clip: 1.0
+seed: 42
+
+# Schedule.
+epochs: 12
+warmup_epochs: 1
+patience: 5
+
+# Sanity-check: log GT-path val each epoch alongside predictor-path val.
+# Early-stop is always on predictor primary_metric (inference-time distribution).
+out_ckpt_name: best_finetuned_soft.pt
